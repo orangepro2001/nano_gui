@@ -117,6 +117,7 @@ const TextRenderer = extern struct {
     vtbl: *const Vtbl,
     target: *IDWriteBitmapRenderTarget,
     color: u32 = 0xFFFFFF,
+    rparams: ?*anyopaque = null,
     const Vtbl = extern struct {
         QueryInterface: *const fn (*anyopaque, *const winapi.GUID, *?*anyopaque) callconv(.winapi) i32,
         AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
@@ -216,7 +217,7 @@ fn cbPixels(_: *anyopaque, _: ?*anyopaque, ppd: *f32) callconv(.winapi) i32 {
 }
 fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: *const GlyphRun, _: *const GlyphRunDescription, _: ?*anyopaque) callconv(.winapi) i32 {
     const r: *TextRenderer = @ptrCast(@alignCast(this));
-    const hr = r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, null, r.color, null);
+    const hr = r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, r.rparams, r.color, null);
     std.debug.print("dwrite glyph run count={d} hr=0x{x}\n", .{ run.glyphCount, @as(u32, @bitCast(hr)) });
     return hr;
 }
@@ -284,8 +285,12 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     var target: ?*IDWriteBitmapRenderTarget = null;
     if (gdi.?.vtbl.CreateBitmapRenderTarget(gdi.?, dc, w, h, &target) < 0 or target == null) return error.DirectWriteFailed;
     defer _ = target.?.vtbl.Release(target.?);
+    var rparams: ?*anyopaque = null;
+    const create_rp = @as(*const fn (*anyopaque, *?*anyopaque) callconv(.winapi) i32, @ptrCast(f.vtbl.pre_text_format[6]));
+    _ = create_rp(f, &rparams);
     const text_color: u32 = @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16);
-    var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color };
+    var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color, .rparams = rparams };
+    renderer.target = target.?;
     const draw_hr = layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0);
     std.debug.print("dwrite layout draw hr=0x{x}\n", .{@as(u32, @bitCast(draw_hr))});
     if (draw_hr < 0) return error.DirectWriteFailed;
