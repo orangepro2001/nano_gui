@@ -91,6 +91,9 @@ jobs:
       - name: Build all examples (Win32 backend)
         run: zig build
 
+      - name: Probe Windows OpenGL version
+        run: .\zig-out\bin\gallery_win32.exe --gl-info
+
       - name: Unit tests (Win32 backend)
         run: zig build test
 

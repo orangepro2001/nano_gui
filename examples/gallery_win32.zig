@@ -102,6 +102,7 @@ extern "opengl32" fn wglMakeCurrent(dc: ?*anyopaque, ctx: ?*anyopaque) callconv(
 extern "opengl32" fn glClearColor(r: f32, g: f32, b: f32, a: f32) callconv(.winapi) void;
 extern "opengl32" fn glClear(mask: u32) callconv(.winapi) void;
 extern "opengl32" fn glViewport(x: i32, y: i32, w: i32, h: i32) callconv(.winapi) void;
+extern "opengl32" fn glGetString(name: u32) callconv(.winapi) ?[*:0]const u8;
 extern "gdi32" fn SetDIBitsToDevice(dc: ?*anyopaque, x: i32, y: i32, w: u32, h: u32, src_x: i32, src_y: i32, start: u32, lines: u32, bits: *const anyopaque, bmi: *const BITMAPINFO, usage: u32) callconv(.winapi) i32;
 
 const PIXELFORMATDESCRIPTOR = extern struct {
@@ -262,6 +263,15 @@ extern "user32" fn DestroyWindow(h: HWND) callconv(.winapi) i32;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    var gl_info = false;
+    {
+        var a = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+        defer a.deinit();
+        _ = a.next();
+        while (a.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--gl-info")) gl_info = true;
+        }
+    }
     var model = try gallery.Model.init(gpa);
     defer model.deinit();
     var app = try nano.app.App.init(gpa, .{ .title = "nano_gui Widget Gallery", .size = .{ .w = 960, .h = 620 } });
@@ -294,6 +304,18 @@ pub fn main(init: std.process.Init) !void {
             if (gl_context != null) _ = wglMakeCurrent(d, gl_context);
         }
         _ = ReleaseDC(hwnd, d);
+    }
+
+    if (gl_info) {
+        if (gl_context != null) {
+            const ver = glGetString(0x1F02) orelse "unknown";
+            const vendor = glGetString(0x1F00) orelse "unknown";
+            const renderer = glGetString(0x1F01) orelse "unknown";
+            std.debug.print("GL_VERSION={s}\nGL_VENDOR={s}\nGL_RENDERER={s}\n", .{ ver, vendor, renderer });
+        } else {
+            std.debug.print("GL_VERSION=unavailable\n", .{});
+        }
+        return;
     }
 
     app.renderOnce(&model, gallery.build);
