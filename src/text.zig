@@ -15,6 +15,7 @@ var layout_cache: [32]?*Layout = @splat(null);
 var layout_cache_idx: usize = 0;
 
 pub const backend_name: []const u8 = "fixed";
+pub const directwrite = @import("text/directwrite.zig");
 
 pub const Family = enum(u16) { ui, mono, _ };
 pub fn registerFamily(_: []const u8) error{OutOfMemory}!Family {

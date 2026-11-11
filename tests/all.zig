@@ -378,6 +378,14 @@ test "AC-W-TEXTAREA-006 document handle API" {
     try std.testing.expectEqualStrings("HELLO\nworld", out);
 }
 
+test "DirectWrite layout metrics on Windows" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    const m = try nano.text.directwrite.measure(std.testing.allocator, "Hello 你好", 16, 400, "Segoe UI");
+    try std.testing.expect(m.width > 0);
+    try std.testing.expect(m.height > 0);
+    try std.testing.expect(m.lines >= 1);
+}
+
 test "AC-TEST-001 fixed backend deterministic" {
     const style = text.Style{ .size = 16 };
     const a = text.measure("Hello 你好", style, 1, .{});
