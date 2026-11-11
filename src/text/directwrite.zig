@@ -218,7 +218,6 @@ fn cbPixels(_: *anyopaque, _: ?*anyopaque, ppd: *f32) callconv(.winapi) i32 {
 fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: *const GlyphRun, _: *const GlyphRunDescription, _: ?*anyopaque) callconv(.winapi) i32 {
     const r: *TextRenderer = @ptrCast(@alignCast(this));
     const hr = r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, r.rparams, r.color, null);
-    std.debug.print("dwrite glyph run count={d} hr=0x{x}\n", .{ run.glyphCount, @as(u32, @bitCast(hr)) });
     return hr;
 }
 fn cbUnderline() callconv(.winapi) void {}
@@ -314,11 +313,6 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     _ = GdiFlush();
     _ = BitBlt(dst_dc, 0, 0, @intCast(w), @intCast(h), memdc, 0, 0, 0x00CC0020);
     const bits = @as([*]u8, @ptrCast(raw_bits orelse return error.DirectWriteFailed))[0 .. @as(usize, w) * h * 4];
-    var dbg_nonzero: usize = 0;
-    for (bits) |b| if (b != 0) {
-        dbg_nonzero += 1;
-    };
-    std.debug.print("dwrite: bitmap {d}x{d} metrics {d}x{d} nonzero={d}\n", .{ w, h, metrics.width, metrics.height, dbg_nonzero });
     // target 为 BGRA；按 alpha 混合到 Canvas 的 RGBA。
     var y: u32 = 0;
     while (y < h) : (y += 1) {

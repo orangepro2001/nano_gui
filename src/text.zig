@@ -416,10 +416,6 @@ pub const ColorSpan = struct { start: u32, end: u32, color: core.Color };
 pub const DrawOptions = struct { spans: []const ColorSpan = &.{}, line_range: ?Range = null };
 
 pub fn draw(canvas: *gfx.Canvas, l: *const Layout, origin: core.Vec2, color: core.Color, opts: DrawOptions) void {
-    if (use_directwrite and builtin.os.tag == .windows) {
-        directwrite.draw(l.allocator, canvas, l.text, l.style.size, l.style.weight, resolvedFamily(l.style.family), origin, color) catch {};
-        return;
-    }
     const adv = advance(l.style, l.scale);
     const glyph_w = @max(1, @min(adv, @round(l.style.size * l.scale * 0.66)));
     const glyph_h = @max(1, @round(l.style.size * l.scale));

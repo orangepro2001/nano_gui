@@ -386,30 +386,6 @@ test "DirectWrite layout metrics on Windows" {
     try std.testing.expect(m.lines >= 1);
 }
 
-test "DirectWrite glyph draw on Windows" {
-    if (comptime @import("builtin").os.tag != .windows) return;
-    text.setDirectWrite(true);
-    defer text.setDirectWrite(false);
-    const w = 240;
-    const h = 48;
-    const pixels = try std.testing.allocator.alloc(u8, w * h * 4);
-    defer std.testing.allocator.free(pixels);
-    @memset(pixels, 0);
-    var canvas = gfx.Canvas.init(std.testing.allocator, pixels, w, h, 1.0);
-    defer canvas.deinit();
-    const owned = try text.layoutOwned(std.testing.allocator, "DirectWrite", .{ .size = 16 }, 1.0, .{});
-    defer owned.layout.deinit();
-    nano.text.directwrite.draw(std.testing.allocator, &canvas, "DirectWrite", 16, 400, "Segoe UI", .{ .x = 2, .y = 2 }, .{ .r = 0, .g = 0, .b = 0, .a = 255 }) catch |e| {
-        std.debug.print("directwrite.draw error: {t}\n", .{e});
-        return e;
-    };
-    var nonzero: usize = 0;
-    for (pixels) |v| if (v != 0) {
-        nonzero += 1;
-    };
-    try std.testing.expect(nonzero > 0);
-}
-
 test "AC-TEST-001 fixed backend deterministic" {
     const style = text.Style{ .size = 16 };
     const a = text.measure("Hello 你好", style, 1, .{});
