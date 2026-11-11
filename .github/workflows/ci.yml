@@ -72,3 +72,30 @@ jobs:
             test-out/
             artifacts/
           if-no-files-found: error
+
+  windows:
+    name: Windows x64 build and Win32 backend tests
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://ziglang.org/download/0.17.1/zig-x86_64-windows-0.17.1.zip -OutFile zig.zip
+          Expand-Archive zig.zip -DestinationPath C:\zig
+          echo "C:\zig\zig-x86_64-windows-0.17.1" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & C:\zig\zig-x86_64-windows-0.17.1\zig.exe version
+
+      - name: Build all examples (Win32 backend)
+        run: zig build
+
+      - name: Unit tests (Win32 backend)
+        run: zig build test
+
+      - name: Golden tests (Win32 + software surface)
+        run: zig build test-golden
+
+      - name: Replay tests (Win32 backend)
+        run: zig build test-replay
