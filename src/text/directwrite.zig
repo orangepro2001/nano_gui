@@ -216,7 +216,9 @@ fn cbPixels(_: *anyopaque, _: ?*anyopaque, ppd: *f32) callconv(.winapi) i32 {
 }
 fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: *const GlyphRun, _: *const GlyphRunDescription, _: ?*anyopaque) callconv(.winapi) i32 {
     const r: *TextRenderer = @ptrCast(@alignCast(this));
-    return r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, null, r.color, null);
+    const hr = r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, null, r.color, null);
+    std.debug.print("dwrite glyph run count={d} hr=0x{x}\n", .{ run.glyphCount, @as(u32, @bitCast(hr)) });
+    return hr;
 }
 fn cbUnderline() callconv(.winapi) void {}
 fn cbStrike() callconv(.winapi) void {}
@@ -284,7 +286,9 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     defer _ = target.?.vtbl.Release(target.?);
     const text_color: u32 = @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16);
     var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color };
-    if (layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0) < 0) return error.DirectWriteFailed;
+    const draw_hr = layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0);
+    std.debug.print("dwrite layout draw hr=0x{x}\n", .{@as(u32, @bitCast(draw_hr))});
+    if (draw_hr < 0) return error.DirectWriteFailed;
     const memdc = target.?.vtbl.GetMemoryDC(target.?) orelse return error.DirectWriteFailed;
     const bmp = GetCurrentObject(memdc, 7) orelse return error.DirectWriteFailed; // OBJ_BITMAP
     const bits = try allocator.alloc(u8, @as(usize, w) * h * 4);
