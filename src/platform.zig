@@ -536,7 +536,7 @@ pub const Window = struct {
 pub const FrameReason = enum { size, paint, timer, nested_modal };
 
 const headless_state = struct {
-    var gpa: std.mem.Allocator = std.heap.page_allocator;
+    var gpa: std.mem.Allocator = std.heap.smp_allocator;
     var initialized: bool = false;
     var windows: std.ArrayListUnmanaged(*Window) = .empty;
     var events: std.ArrayListUnmanaged(Event) = .empty;

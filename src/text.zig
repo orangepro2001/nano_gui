@@ -241,7 +241,7 @@ pub const OwnedLayout = struct {
 pub fn layout(text: []const u8, style: Style, scale: f32, opts: LayoutOptions) *const Layout {
     const slot = layout_cache_idx % layout_cache.len;
     if (layout_cache[slot]) |old| old.deinit();
-    const alloc = backend_allocator orelse std.heap.page_allocator;
+    const alloc = backend_allocator orelse std.heap.smp_allocator;
     const owned = layoutOwned(alloc, text, style, scale, opts) catch unreachable;
     layout_cache[slot] = owned.layout;
     layout_cache_idx += 1;
@@ -333,7 +333,7 @@ pub fn layoutOwned(allocator: std.mem.Allocator, text_in: []const u8, style: Sty
 pub fn measure(text: []const u8, style: Style, scale: f32, opts: LayoutOptions) core.Size {
     var effective = opts;
     effective.max_width = null;
-    const l = layoutOwned(std.heap.page_allocator, text, style, scale, effective) catch return .{};
+    const l = layoutOwned(std.heap.smp_allocator, text, style, scale, effective) catch return .{};
     defer l.layout.deinit();
     return l.layout.size;
 }
@@ -506,7 +506,7 @@ pub fn beginBuild() void {
     };
     if (!S.ready) {
         S.ready = true;
-        if (backend_allocator == null) init(std.heap.page_allocator, .{}) catch {};
+        if (backend_allocator == null) init(std.heap.smp_allocator, .{}) catch {};
     }
 }
 pub fn onSettingsChanged() void {}

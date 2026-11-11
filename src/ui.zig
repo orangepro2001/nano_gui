@@ -219,6 +219,9 @@ pub const Ui = struct {
     hover_rebuild_requested: bool = false,
     shortcut_source: ?input.ShortcutSource = null,
     ime_active: bool = false,
+    command_ctx: ?*anyopaque = null,
+    command_title_fn: ?*const fn (?*anyopaque, input.CommandId) []const u8 = null,
+    command_invoke_fn: ?*const fn (?*anyopaque, input.CommandId) void = null,
     ime_buffer: std.ArrayListUnmanaged(u8) = .empty,
     built_this_frame: bool = false,
     sticky_limit: usize = 4096,
@@ -941,6 +944,20 @@ pub const Ui = struct {
     /// 接入命令快捷键表（11）。线程：界面线程。
     pub fn setShortcutSource(self: *Ui, source: ?input.ShortcutSource) void {
         self.shortcut_source = source;
+    }
+
+    pub fn setCommands(self: *Ui, ctx: ?*anyopaque, titleFn: ?*const fn (?*anyopaque, input.CommandId) []const u8, invokeFn: ?*const fn (?*anyopaque, input.CommandId) void) void {
+        self.command_ctx = ctx;
+        self.command_title_fn = titleFn;
+        self.command_invoke_fn = invokeFn;
+    }
+    pub fn commandTitle(self: *const Ui, cmd_id: input.CommandId) []const u8 {
+        if (self.command_title_fn) |f| return f(self.command_ctx, cmd_id);
+        return "";
+    }
+    pub fn invokeCommand(self: *Ui, cmd_id: input.CommandId) void {
+        if (self.command_invoke_fn) |f| f(self.command_ctx, cmd_id);
+        self.invalidate(.build);
     }
 
     // ---- 帧 ----

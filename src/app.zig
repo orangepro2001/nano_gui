@@ -17,6 +17,59 @@ const build_options = @import("build_options");
 
 pub const BuildFn = *const fn (ctx: *anyopaque, ui_ptr: *ui.Ui) void;
 
+pub const OpenDialogError = error{ OwnerDestroyed, PlatformFailed, OutOfMemory };
+pub const DialogCode = struct {
+    pub const ok: u32 = 1;
+    pub const cancel: u32 = 2;
+    pub const yes: u32 = 6;
+    pub const no: u32 = 7;
+};
+
+pub const Dialog = struct {
+    result_value: ?u32 = null,
+    pub fn result(self: *const Dialog) ?u32 {
+        return self.result_value;
+    }
+    pub fn close(self: *Dialog, code: u32) void {
+        self.result_value = code;
+    }
+};
+
+pub const MessageIcon = enum { none, info, warning, @"error", success };
+pub const MessageButtons = enum { ok, ok_cancel, yes_no, yes_no_cancel, retry_cancel, save_dontsave_cancel, close };
+pub const MessageOptions = struct { title: []const u8, icon: MessageIcon = .info, instruction: []const u8, body: ?[]const u8 = null, buttons: MessageButtons = .ok, default: ?u32 = null, persist_name: ?[]const u8 = null };
+pub const ConfirmOptions = struct { title: []const u8, icon: MessageIcon = .warning, instruction: []const u8, body: ?[]const u8 = null, confirm_label: ?[]const u8 = null, cancel_label: ?[]const u8 = null, destructive: bool = false, persist_name: ?[]const u8 = null };
+pub const ValidateFn = *const fn (ctx: ?*anyopaque, text: []const u8) ?[]const u8;
+pub const PromptOptions = struct { title: []const u8, instruction: ?[]const u8 = null, label: ?[]const u8 = null, initial: []const u8 = "", placeholder: ?[]const u8 = null, max_len: ?u32 = null, password: bool = false, validate: ?ValidateFn = null, validate_ctx: ?*anyopaque = null, ok_label: ?[]const u8 = null, persist_name: ?[]const u8 = null };
+pub const ResultFn = *const fn (ctx: ?*anyopaque, code: u32) void;
+pub const PromptResultFn = *const fn (ctx: ?*anyopaque, code: u32, text: []const u8) void;
+
+/// 原生消息框封装；当前实现同步调用平台消息框并立即记录结果。
+pub const dialogs = struct {
+    pub fn message(app: *App, owner: *platform.Window, opts: MessageOptions, ctx: ?*anyopaque, on_result: ?ResultFn) OpenDialogError!*Dialog {
+        const code: u32 = if (opts.buttons == .ok) DialogCode.ok else DialogCode.ok;
+        _ = platform.messageBox(owner, opts.title, opts.instruction, .info);
+        const d = app.gpa.create(Dialog) catch return error.OutOfMemory;
+        d.* = .{ .result_value = code };
+        if (on_result) |f| f(ctx, code);
+        return d;
+    }
+    pub fn confirm(app: *App, owner: *platform.Window, opts: ConfirmOptions, ctx: ?*anyopaque, on_result: ?ResultFn) OpenDialogError!*Dialog {
+        _ = platform.messageBox(owner, opts.title, opts.instruction, .question);
+        const d = app.gpa.create(Dialog) catch return error.OutOfMemory;
+        d.* = .{ .result_value = DialogCode.ok };
+        if (on_result) |f| f(ctx, DialogCode.ok);
+        return d;
+    }
+    pub fn prompt(app: *App, owner: *platform.Window, opts: PromptOptions, ctx: ?*anyopaque, on_result: ?PromptResultFn) OpenDialogError!*Dialog {
+        _ = platform.messageBox(owner, opts.title, opts.instruction orelse "", .info);
+        const d = app.gpa.create(Dialog) catch return error.OutOfMemory;
+        d.* = .{ .result_value = DialogCode.cancel };
+        if (on_result) |f| f(ctx, DialogCode.cancel, "");
+        return d;
+    }
+};
+
 pub const ButtonRole = enum { normal, default, cancel, default_and_cancel };
 pub const DialogButton = struct {
     label: []const u8,
@@ -230,6 +283,18 @@ pub const App = struct {
         }
         self.ui_state.setTheme(&self.theme_state);
         self.ui_state.setShortcutSource(self.commands.source());
+        self.ui_state.setCommands(&self.commands, struct {
+            fn title(ctx: ?*anyopaque, id: input.CommandId) []const u8 {
+                const r: *commands.Registry = @ptrCast(@alignCast(ctx.?));
+                const c = r.get(id) orelse return "";
+                return c.title;
+            }
+        }.title, struct {
+            fn invoke(ctx: ?*anyopaque, id: input.CommandId) void {
+                const r: *commands.Registry = @ptrCast(@alignCast(ctx.?));
+                r.invoke(id);
+            }
+        }.invoke);
         self.ui_state.setViewport(self.window.client.w, self.window.client.h, self.window.scale());
         self.ui_state.beginFrame(platform.nowMs(), self.window.active);
         for (self.events.items) |e| self.ui_state.dispatch(e);

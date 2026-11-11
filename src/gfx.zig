@@ -8,7 +8,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const platform = @import("platform.zig");
 
-var gfx_allocator: std.mem.Allocator = std.heap.page_allocator;
+var gfx_allocator: std.mem.Allocator = std.heap.smp_allocator;
 
 /// 注入持久分配器（由 App 在初始化时调用）。
 pub fn init(allocator: std.mem.Allocator) void {

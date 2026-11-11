@@ -2836,6 +2836,9 @@ pub fn endMenu(ui_ptr: *Ui) void {
 pub fn menuItem(ui_ptr: *Ui, src: std.builtin.SourceLocation, label_text: []const u8, opts: MenuItemOptions) MenuItemResult {
     const r = button(ui_ptr, src, label_text, .{ .variant = .quiet, .key = opts.key, .enabled = opts.enabled, .icon = opts.icon });
     const result = MenuItemResult{ .hovered = r.hovered, .clicked = r.clicked };
+    if (r.clicked) {
+        if (opts.command) |cmd| ui_ptr.invokeCommand(cmd);
+    }
     if (r.clicked and ui_ptr.open_menu != .none) {
         const st = ui_ptr.stateSticky(bool, ui_ptr.open_menu, false);
         st.* = false;
@@ -2992,6 +2995,26 @@ pub fn toolbarButton(ui_ptr: *Ui, src: std.builtin.SourceLocation, label_text: [
         .tooltip = opts.tooltip,
         .layout = opts.layout,
     });
+    return .{ .clicked = r.clicked, .hovered = r.hovered };
+}
+
+pub const ToolbarCommandOptions = struct {
+    key: ?ui.Key = null,
+    debug_name: ?[]const u8 = null,
+    show_text: bool = false,
+    overflow: enum { menu, pinned } = .menu,
+};
+
+pub fn toolbarCommand(ui_ptr: *Ui, src: std.builtin.SourceLocation, cmd: input.CommandId, opts: ToolbarCommandOptions) ToolbarButtonResult {
+    const title = ui_ptr.commandTitle(cmd);
+    const r = button(ui_ptr, src, if (opts.show_text) title else "", .{
+        .key = opts.key,
+        .debug_name = opts.debug_name,
+        .variant = .quiet,
+        .icon = .{ .mark = .more },
+        .tooltip = if (title.len > 0) title else null,
+    });
+    if (r.clicked) ui_ptr.invokeCommand(cmd);
     return .{ .clicked = r.clicked, .hovered = r.hovered };
 }
 

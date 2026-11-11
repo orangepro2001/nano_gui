@@ -132,6 +132,13 @@ pub fn page(u: *ui.Ui, m: *Model) void {
         w.endMenu(u);
     }
     w.endMenuBar(u);
+    _ = w.beginToolbar(u, @src(), .{ .debug_name = "toolbar" });
+    _ = w.toolbarButton(u, @src(), "Search", .{ .icon = .{ .mark = .search }, .show_text = true });
+    w.toolbarSeparator(u, @src());
+    _ = w.toolbarCommand(u, @src(), .none, .{ .show_text = true });
+    w.toolbarSpacer(u, @src());
+    _ = w.toolbarButton(u, @src(), "Settings", .{ .icon = .{ .mark = .more }, .show_text = false });
+    w.endToolbar(u);
     _ = w.separator(u, @src(), .{ .structural = true });
 
     // 主内容：滚动视图内的两列
