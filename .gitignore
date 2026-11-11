@@ -1,0 +1,14 @@
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+# 测试产物
+/test-out/
+*.actual.png
+*.diff.png
