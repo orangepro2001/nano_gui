@@ -30,6 +30,7 @@ fn scene(ctx: *anyopaque, u: *ui.Ui) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    nano.platform.forceHeadless();
     const gpa = init.gpa;
     var m = Model{};
     var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 800, .h = 600 } });

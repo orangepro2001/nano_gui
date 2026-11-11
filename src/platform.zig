@@ -455,7 +455,7 @@ pub const Window = struct {
     }
     pub fn setTitle(self: *Window, title: []const u8) void {
         self.title = title;
-        if (comptime is_windows) {
+        if (is_windows and !headless_state.force_headless) {
             if (self.hwnd) |h| {
                 const z = std.unicode.utf8ToUtf16LeAllocZ(headless_state.gpa, title) catch return;
                 defer headless_state.gpa.free(z);
@@ -473,14 +473,14 @@ pub const Window = struct {
     }
     pub fn show(self: *Window) void {
         self.visible = true;
-        if (comptime is_windows) {
+        if (is_windows and !headless_state.force_headless) {
             if (self.hwnd) |h| _ = w32.ShowWindow(h, 5);
         }
         pushVisibility(self);
     }
     pub fn hide(self: *Window) void {
         self.visible = false;
-        if (comptime is_windows) {
+        if (is_windows and !headless_state.force_headless) {
             if (self.hwnd) |h| _ = w32.ShowWindow(h, 0);
         }
         pushVisibility(self);
@@ -488,7 +488,7 @@ pub const Window = struct {
     pub fn minimize(self: *Window) void {
         self.minimized = true;
         self.visible = true;
-        if (comptime is_windows) {
+        if (is_windows and !headless_state.force_headless) {
             if (self.hwnd) |h| _ = w32.ShowWindow(h, 6);
         }
         pushVisibility(self);
@@ -499,7 +499,7 @@ pub const Window = struct {
     pub fn restore(self: *Window) void {
         self.minimized = false;
         self.visible = true;
-        if (comptime is_windows) {
+        if (is_windows and !headless_state.force_headless) {
             if (self.hwnd) |h| _ = w32.ShowWindow(h, 9);
         }
         pushVisibility(self);
@@ -562,6 +562,7 @@ pub const FrameReason = enum { size, paint, timer, nested_modal };
 
 const headless_state = struct {
     var gpa: std.mem.Allocator = std.heap.smp_allocator;
+    var force_headless: bool = false;
     var initialized: bool = false;
     var windows: std.ArrayListUnmanaged(*Window) = .empty;
     var events: std.ArrayListUnmanaged(Event) = .empty;
@@ -699,9 +700,14 @@ fn pushVisibility(win: *Window) void {
     headless_state.events.append(headless_state.gpa, e) catch {};
 }
 
+/// 测试夹具/回放运行器可强制使用 headless 后端（REQ-TEST-020）。
+pub fn forceHeadless() void {
+    headless_state.force_headless = true;
+}
+
 pub fn init(allocator: std.mem.Allocator) !void {
     if (headless_state.initialized) return;
-    if (comptime is_windows) w32Init();
+    if (is_windows and !headless_state.force_headless) w32Init();
     headless_state.gpa = allocator;
     headless_state.initialized = true;
     headless_state.metrics = .{};
@@ -722,7 +728,7 @@ pub fn deinit() void {
 }
 
 pub fn createWindow(opts: WindowOptions) !*Window {
-    if (comptime is_windows) return w32CreateWindow(opts);
+    if (is_windows and !headless_state.force_headless) return w32CreateWindow(opts);
     const w = try headless_state.gpa.create(Window);
     w.* = .{
         .id = headless_state.next_id,
@@ -755,7 +761,7 @@ pub fn createPopup(owner: *Window, spec: PopupWindowSpec) !*Window {
 }
 
 pub fn destroyWindow(w: *Window) void {
-    if (comptime is_windows) {
+    if (is_windows and !headless_state.force_headless) {
         if (w.hwnd) |h| {
             _ = w32.DestroyWindow(h);
             w.hwnd = null;
@@ -781,7 +787,7 @@ pub fn setFrameCallback(w: *Window, ctx: ?*anyopaque, cb: *const fn (w: *Window,
 }
 
 pub fn pumpMessages(sink: EventSink) usize {
-    if (comptime is_windows) _ = w32Pump();
+    if (is_windows and !headless_state.force_headless) _ = w32Pump();
     var n: usize = 0;
     while (headless_state.events.items.len > 0) {
         const e = headless_state.events.orderedRemove(0);
@@ -804,7 +810,7 @@ pub fn pumpMessages(sink: EventSink) usize {
 pub const WaitResult = enum { message, woken, timeout, idle };
 
 pub fn waitMessages(timeout_ms: ?u32) WaitResult {
-    if (comptime is_windows) return w32Wait(timeout_ms);
+    if (is_windows and !headless_state.force_headless) return w32Wait(timeout_ms);
     if (headless_state.events.items.len > 0) return .message;
     if (headless_state.wake_flag.swap(false, .acq_rel)) return .woken;
     if (timeout_ms) |ms| {
@@ -817,12 +823,12 @@ pub fn waitMessages(timeout_ms: ?u32) WaitResult {
 
 pub fn wake() void {
     headless_state.wake_flag.store(true, .release);
-    if (comptime is_windows) _ = w32.PostThreadMessageW(w32_thread_id, 0, 0, 0);
+    if (is_windows and !headless_state.force_headless) _ = w32.PostThreadMessageW(w32_thread_id, 0, 0, 0);
 }
 
 pub fn nowMs() u64 {
     if (injected_clock) |clock| return clock.now_ms(clock.ctx);
-    if (comptime is_windows) return w32Now();
+    if (is_windows and !headless_state.force_headless) return w32Now();
     return headless_state.now_ms;
 }
 
@@ -889,7 +895,7 @@ pub fn allowSessionEnd(_: bool) void {}
 
 pub fn present(w: *Window) void {
     headless_state.present_count += 1;
-    if (comptime is_windows) w32Present(w);
+    if (is_windows and !headless_state.force_headless) w32Present(w);
 }
 
 pub const clipboard = struct {
