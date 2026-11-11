@@ -293,6 +293,11 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     bmi.bmiHeader.biWidth = @intCast(w);
     bmi.bmiHeader.biHeight = -@as(i32, @intCast(h));
     if (GetDIBits(memdc, bmp, 0, h, bits.ptr, &bmi, 0) == 0) return error.DirectWriteFailed;
+    var dbg_nonzero: usize = 0;
+    for (bits) |b| if (b != 0) {
+        dbg_nonzero += 1;
+    };
+    std.debug.print("dwrite: bitmap {d}x{d} metrics {d}x{d} nonzero={d}\n", .{ w, h, metrics.width, metrics.height, dbg_nonzero });
     // target 为 BGRA；按 alpha 混合到 Canvas 的 RGBA。
     var y: u32 = 0;
     while (y < h) : (y += 1) {
