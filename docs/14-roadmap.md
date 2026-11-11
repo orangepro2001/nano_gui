@@ -26,7 +26,7 @@
 - `core`：数学类型、哈希、帧竞技场、日志、统计计数器。
 - `platform` Win32：窗口类与创建、主循环（阻塞等待）、Per-Monitor DPI v2、DWM 深色标题栏、尺寸变化、关闭请求、WGL 上下文与清屏呈现、`fatal`、系统外观与系统度量的读取与变化通知。
 - `platform` GLFW：窗口、循环、无头模式、假时钟与事件注入的骨架。
-- NanoVG 与 GLFW 源码 vendoring（需先决定 OPEN-001）。
+- NanoVG 与 GLFW 源码 vendoring，连同上游许可文本与 `THIRD_PARTY_NOTICES.md` 登记；仓库根目录 `LICENSE`（ADR 0010，REQ-CONV-030 至 REQ-CONV-032）。
 
 **不含**：任何绘制内容（只清屏为 `surface_window` 色）、文字、输入路由。
 

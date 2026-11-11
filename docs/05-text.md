@@ -174,7 +174,7 @@ DirectWrite 后端使用 `IDWriteTextLayout` 的断行结果，其细节可能�
 
 ### 3.7 GLFW 后端与固定度量后端
 
-**REQ-TEXT-037**　`fontstash` 后端：以 NanoVG 的 fontstash（stb_truetype）加载仓库内的测试字体文件，放在 `tests/fonts/`，字体文件及其许可文本一并入库，许可挂靠 OPEN-001（未决前不得提交来源不明的字体）。该后端**只保证**：度量稳定（同一字体文件、字号、`scale` 下跨运行与跨机器的宽度、行高逐位相同）；拉丁字母（U+0020–U+007E、U+00A0–U+00FF）与《通用规范汉字表》一级字（3500 字）及常用中文标点可显示。缺字显示缺字字形。该后端不做复杂文种整形、不做字体回退链、不做双向重排（全部按从左到右），且**不保证**与 DirectWrite 像素一致。字族令牌 `ui` 与 `mono` 都解析到测试字体（`mono` 可为同一文件）；其族名为 `NanoTestSans`（REQ-PLAT-084）。光栅化同样遵循 REQ-TEXT-026、REQ-TEXT-027，使用同一图集机制。
+**REQ-TEXT-037**　`fontstash` 后端：以 NanoVG 的 fontstash（stb_truetype）加载仓库内的测试字体文件，放在 `tests/fonts/`，字体文件及其许可文本一并入库，许可与登记要求见 ADR 0010 与 REQ-CONV-031、REQ-CONV-032（来源不明的字体不得入库）。该后端**只保证**：度量稳定（同一字体文件、字号、`scale` 下跨运行与跨机器的宽度、行高逐位相同）；拉丁字母（U+0020–U+007E、U+00A0–U+00FF）、《通用规范汉字表》一级字（3500 字）及常用中文标点、KS X 1001 收录的 2350 个现代韩文音节（均位于 U+AC00–U+D7A3）与韩文兼容字母 U+3131–U+3163 可显示。缺字显示缺字字形。韩文只保证预组合音节：组合用字母序列（U+1100–U+11FF、U+A960–U+A97F、U+D7B0–U+D7FF）不合成为音节，按码位逐个字形绘制，字素簇边界仍按 REQ-TEXT-021。该后端不做复杂文种整形、不做字体回退链、不做双向重排（全部按从左到右），且**不保证**与 DirectWrite 像素一致。字族令牌 `ui` 与 `mono` 都解析到测试字体（`mono` 可为同一文件）；其族名为 `NanoTestSans`（REQ-PLAT-084）。光栅化同样遵循 REQ-TEXT-026、REQ-TEXT-027，使用同一图集机制。
 
 **REQ-TEXT-038**　固定度量测试后端 `fixed`：不加载任何字体。**每个字素簇的前进宽度固定**为 `round(0.5 × ppx_size)` ppx（零宽字符与换行簇为 0），`ascent = 1.0 × ppx_size`、`descent = 0.25 × ppx_size`、`line_gap = 0`（均取整规则同 REQ-TEXT-009）。断行严格遵循 REQ-TEXT-016。`text.draw` 不绘制，仅向 `text.testing.drawLog()` 记录 `(layout, origin, color)`。该后端用于布局、控件逻辑的单元测试，使宽度、高度、换行位置、命中位置都可精确断言；`zig build test` 默认使用该后端（`text.backend_name` 为 `"fixed"`），`zig build test-golden` 使用平台默认后端。
 
@@ -415,7 +415,7 @@ pub const testing = struct {
 
 **AC-TEXT-026**　`[人工]` 覆盖：REQ-TEXT-036。Windows 上运行含大量文字的示例页（含 `stats` 叠加）。依次：更改系统缩放（跨显示器拖动窗口）、更改"文本大小"辅助功能、更改系统消息字体（注册表或第三方工具）。预期：每次变化后 1 秒内文字完成更新，字形清晰无旧字号残留；`cache.text_layout.entries` 在变化后的第一次构建前为 0；`atlas_used_ppx` 回落后重新增长；`raster_count` 与 `shape_count` 在变化后重新增长；无崩溃、无内存增长（连续切换 20 次后 `atlas_pages` ≤ 上限）。
 
-**AC-TEXT-027**　`[单元]` 覆盖：REQ-TEXT-037。(1) 度量稳定：`measure("Hello, 世界", NanoTestSans 12, 1.0)` 与 `tests/golden-metrics.txt` 中记录的常量逐位相等；两台不同机器（CI 与本地）与 100 次重复结果相同；`scale = 1.25/1.5/2.0` 同理。(2) 覆盖：U+0020–U+007E、U+00A0–U+00FF 与 `tests/fonts/coverage.txt` 列出的全部 3500 个一级字及常用中文标点，字体均含非缺字字形；缺字（如 U+0E01）显示缺字字形且宽度等于其字形宽度。(3) 阿拉伯文串在 `fontstash` 后端按从左到右排版、不崩溃。(4) `tests/fonts/` 下每个字体文件有对应的许可文本，`README` 注明挂靠 OPEN-001；脚本断言无未登记的字体文件。
+**AC-TEXT-027**　`[单元]` 覆盖：REQ-TEXT-037。(1) 度量稳定：`measure("Hello, 世界", NanoTestSans 12, 1.0)` 与 `tests/golden-metrics.txt` 中记录的常量逐位相等，`measure("안녕하세요", NanoTestSans 12, 1.0)` 同样与该文件中记录的常量逐位相等；两台不同机器（CI 与本地）与 100 次重复结果相同；`scale = 1.25/1.5/2.0` 同理。(2) 覆盖：U+0020–U+007E、U+00A0–U+00FF、U+3131–U+3163 与 `tests/fonts/coverage.txt` 列出的全部 3500 个一级字、常用中文标点及 2350 个 KS X 1001 韩文音节，字体均含非缺字字形；组合用字母序列 U+1100 U+1161 不合成为 U+AC00，排版结果为一个字素簇，宽度等于两个码位各自字形（或缺字字形）宽度之和；缺字（如 U+0E01）显示缺字字形且宽度等于其字形宽度。(3) 阿拉伯文串在 `fontstash` 后端按从左到右排版、不崩溃。(4) `tests/fonts/` 下每个字体文件有对应的许可文本，并在 `THIRD_PARTY_NOTICES.md` 中登记（REQ-CONV-032，与 AC-CONV-030 为同一检查）；脚本断言无未登记的字体文件。
 
 **AC-TEXT-028**　`[单元]` 覆盖：REQ-TEXT-038。`zig build test` 的默认 `text.backend_name == "fixed"`；`measure("abcd", 12, 1.0) = {24, 15}`；`scale = 1.25` 时每簇 8 ppx（`round(0.5 × 15)`）；`"\u{200B}"`、`"\n"`、BEL 的宽度为 0；`text.draw` 不触碰图集与 `gfx`，`testing.drawLog()` 记录每次调用的 `(layout, origin, color)`；`test-golden` 构建使用 `fontstash`（`backend_name == "fontstash"`）。
 
