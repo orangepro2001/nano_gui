@@ -45,7 +45,7 @@ const IDWriteTextLayout = extern struct {
         /// IDWriteTextFormat 的 25 个方法 + layout 的 Set*/Get*/Draw/GetLineMetrics 等，
         /// 直到 GetMetrics 之前的全部槽位（顺序以 dwrite.h 为准）。
         before_draw: [55]*const fn () callconv(.winapi) void,
-        Draw: *const fn (*anyopaque, *anyopaque, f32, f32) callconv(.winapi) i32,
+        Draw: *const fn (*anyopaque, ?*anyopaque, *anyopaque, f32, f32) callconv(.winapi) i32,
         GetLineMetrics: *const fn () callconv(.winapi) void,
         GetMetrics: *const fn (*anyopaque, *TextMetrics) callconv(.winapi) i32,
         after_metrics: [6]*const fn () callconv(.winapi) void,
@@ -284,7 +284,7 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     defer _ = target.?.vtbl.Release(target.?);
     const text_color: u32 = @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16);
     var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color };
-    if (layout.?.vtbl.Draw(layout.?, @ptrCast(&renderer), 2.0, 2.0) < 0) return error.DirectWriteFailed;
+    if (layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0) < 0) return error.DirectWriteFailed;
     const memdc = target.?.vtbl.GetMemoryDC(target.?) orelse return error.DirectWriteFailed;
     const bmp = GetCurrentObject(memdc, 7) orelse return error.DirectWriteFailed; // OBJ_BITMAP
     const bits = try allocator.alloc(u8, @as(usize, w) * h * 4);
