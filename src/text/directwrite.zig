@@ -299,8 +299,9 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
         var x: u32 = 0;
         while (x < w) : (x += 1) {
             const o = (@as(usize, y) * w + x) * 4;
-            const a = bits[o + 3];
-            if (a == 0) continue;
+            const rgb_nonzero = bits[o] != 0 or bits[o + 1] != 0 or bits[o + 2] != 0;
+            if (!rgb_nonzero) continue;
+            const a = if (bits[o + 3] == 0) 255 else bits[o + 3];
             const px = core.Color{ .r = bits[o + 2], .g = bits[o + 1], .b = bits[o], .a = a };
             canvas.blitPixel(origin.x + @as(f32, @floatFromInt(x)), origin.y + @as(f32, @floatFromInt(y)), px);
         }
