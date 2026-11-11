@@ -83,6 +83,17 @@ pub fn build(b: *std.Build) void {
         win_mod.linkSystemLibrary("opengl32", .{});
         const win_exe = b.addExecutable(.{ .name = "gallery_win32", .root_module = win_mod });
         b.installArtifact(win_exe);
+
+        const platform_win = b.addExecutable(.{
+            .name = "platform_win32",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/platform_win32.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "nano_gui", .module = mod }},
+            }),
+        });
+        b.installArtifact(platform_win);
     }
 
     // ---- 单元测试 ----

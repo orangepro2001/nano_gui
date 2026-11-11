@@ -10,6 +10,8 @@ const core = @import("core.zig");
 const builtin = @import("builtin");
 
 pub const backend_name: []const u8 = if (builtin.os.tag == .windows) "win32" else "headless";
+const is_windows = builtin.os.tag == .windows;
+const winapi = std.os.windows;
 
 pub const CursorShape = enum {
     arrow,
@@ -425,6 +427,10 @@ pub const Window = struct {
     owner: ?*Window = null,
     cursor: CursorShape = .arrow,
     capture: bool = false,
+    hwnd: ?winapi.HWND = null,
+    present_rgba: []const u8 = &.{},
+    present_w: u32 = 0,
+    present_h: u32 = 0,
     presented: []u8 = &.{},
     present_count: u64 = 0,
     frame_callback: ?*const fn (w: *Window, reason: FrameReason) void = null,
@@ -449,6 +455,13 @@ pub const Window = struct {
     }
     pub fn setTitle(self: *Window, title: []const u8) void {
         self.title = title;
+        if (comptime is_windows) {
+            if (self.hwnd) |h| {
+                const z = std.unicode.utf8ToUtf16LeAllocZ(headless_state.gpa, title) catch return;
+                defer headless_state.gpa.free(z);
+                _ = w32.SetWindowTextW(h, z.ptr);
+            }
+        }
     }
     pub fn setClientSize(self: *Window, size: core.Size) void {
         self.client = .{ .w = @intFromFloat(@round(size.w * self.scale_value)), .h = @intFromFloat(@round(size.h * self.scale_value)) };
@@ -460,15 +473,24 @@ pub const Window = struct {
     }
     pub fn show(self: *Window) void {
         self.visible = true;
+        if (comptime is_windows) {
+            if (self.hwnd) |h| _ = w32.ShowWindow(h, 5);
+        }
         pushVisibility(self);
     }
     pub fn hide(self: *Window) void {
         self.visible = false;
+        if (comptime is_windows) {
+            if (self.hwnd) |h| _ = w32.ShowWindow(h, 0);
+        }
         pushVisibility(self);
     }
     pub fn minimize(self: *Window) void {
         self.minimized = true;
         self.visible = true;
+        if (comptime is_windows) {
+            if (self.hwnd) |h| _ = w32.ShowWindow(h, 6);
+        }
         pushVisibility(self);
     }
     pub fn maximize(self: *Window) void {
@@ -477,6 +499,9 @@ pub const Window = struct {
     pub fn restore(self: *Window) void {
         self.minimized = false;
         self.visible = true;
+        if (comptime is_windows) {
+            if (self.hwnd) |h| _ = w32.ShowWindow(h, 9);
+        }
         pushVisibility(self);
     }
     pub fn setMinClientSize(self: *Window, size: core.Size) void {
@@ -676,6 +701,7 @@ fn pushVisibility(win: *Window) void {
 
 pub fn init(allocator: std.mem.Allocator) !void {
     if (headless_state.initialized) return;
+    if (comptime is_windows) w32Init();
     headless_state.gpa = allocator;
     headless_state.initialized = true;
     headless_state.metrics = .{};
@@ -696,6 +722,7 @@ pub fn deinit() void {
 }
 
 pub fn createWindow(opts: WindowOptions) !*Window {
+    if (comptime is_windows) return w32CreateWindow(opts);
     const w = try headless_state.gpa.create(Window);
     w.* = .{
         .id = headless_state.next_id,
@@ -728,6 +755,12 @@ pub fn createPopup(owner: *Window, spec: PopupWindowSpec) !*Window {
 }
 
 pub fn destroyWindow(w: *Window) void {
+    if (comptime is_windows) {
+        if (w.hwnd) |h| {
+            _ = w32.DestroyWindow(h);
+            w.hwnd = null;
+        }
+    }
     for (headless_state.windows.items, 0..) |item, i| {
         if (item == w) {
             _ = headless_state.windows.orderedRemove(i);
@@ -748,6 +781,7 @@ pub fn setFrameCallback(w: *Window, ctx: ?*anyopaque, cb: *const fn (w: *Window,
 }
 
 pub fn pumpMessages(sink: EventSink) usize {
+    if (comptime is_windows) _ = w32Pump();
     var n: usize = 0;
     while (headless_state.events.items.len > 0) {
         const e = headless_state.events.orderedRemove(0);
@@ -770,6 +804,7 @@ pub fn pumpMessages(sink: EventSink) usize {
 pub const WaitResult = enum { message, woken, timeout, idle };
 
 pub fn waitMessages(timeout_ms: ?u32) WaitResult {
+    if (comptime is_windows) return w32Wait(timeout_ms);
     if (headless_state.events.items.len > 0) return .message;
     if (headless_state.wake_flag.swap(false, .acq_rel)) return .woken;
     if (timeout_ms) |ms| {
@@ -782,10 +817,12 @@ pub fn waitMessages(timeout_ms: ?u32) WaitResult {
 
 pub fn wake() void {
     headless_state.wake_flag.store(true, .release);
+    if (comptime is_windows) _ = w32.PostThreadMessageW(w32_thread_id, 0, 0, 0);
 }
 
 pub fn nowMs() u64 {
     if (injected_clock) |clock| return clock.now_ms(clock.ctx);
+    if (comptime is_windows) return w32Now();
     return headless_state.now_ms;
 }
 
@@ -850,8 +887,9 @@ pub fn validatePlacement(p: WindowPlacement) WindowPlacement {
 
 pub fn allowSessionEnd(_: bool) void {}
 
-pub fn present(_: *Window) void {
+pub fn present(w: *Window) void {
     headless_state.present_count += 1;
+    if (comptime is_windows) w32Present(w);
 }
 
 pub const clipboard = struct {
@@ -940,4 +978,304 @@ test "headless event injection" {
     S.got = 0;
     _ = pumpMessages(.{ .func = S.sink });
     try std.testing.expectEqual(@as(usize, 1), S.got);
+}
+
+// ---------------------------------------------------------------------------
+// Win32 一等后端（编译期选择；Linux 构建不进入这些分支）
+// ---------------------------------------------------------------------------
+
+const w32 = struct {
+    const WM_DESTROY: u32 = 0x0002;
+    const WM_CLOSE: u32 = 0x0010;
+    const WM_PAINT: u32 = 0x000F;
+    const WM_SIZE: u32 = 0x0005;
+    const WM_MOUSEMOVE: u32 = 0x0200;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const WM_RBUTTONDOWN: u32 = 0x0204;
+    const WM_RBUTTONUP: u32 = 0x0205;
+    const WM_MBUTTONDOWN: u32 = 0x0207;
+    const WM_MBUTTONUP: u32 = 0x0208;
+    const WM_MOUSEWHEEL: u32 = 0x020A;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
+    const WM_SYSKEYUP: u32 = 0x0105;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_SETFOCUS: u32 = 0x0007;
+    const WM_KILLFOCUS: u32 = 0x0008;
+    const WM_ACTIVATE: u32 = 0x0006;
+    const WM_ACTIVATEAPP: u32 = 0x001C;
+    const WM_DPICHANGED: u32 = 0x02E0;
+    const WM_GETMINMAXINFO: u32 = 0x0024;
+    const WM_SETCURSOR: u32 = 0x0020;
+    const WM_ERASEBKGND: u32 = 0x0014;
+    const WM_TIMER: u32 = 0x0113;
+    const PM_REMOVE: u32 = 1;
+    const QS_ALLINPUT: u32 = 0x04FF;
+    const MWMO_INPUTAVAILABLE: u32 = 0x0004;
+    const CW_USEDEFAULT: i32 = -2147483648;
+
+    const WNDCLASSW = extern struct {
+        style: u32 = 0,
+        lpfnWndProc: *const fn (winapi.HWND, u32, usize, isize) callconv(.winapi) isize = undefined,
+        cbClsExtra: i32 = 0,
+        cbWndExtra: i32 = 0,
+        hInstance: ?winapi.HINSTANCE = null,
+        hIcon: ?*anyopaque = null,
+        hCursor: ?*anyopaque = null,
+        hbrBackground: ?*anyopaque = null,
+        lpszMenuName: ?[*:0]const u16 = null,
+        lpszClassName: [*:0]const u16 = undefined,
+    };
+    const RECT = extern struct { left: i32 = 0, top: i32 = 0, right: i32 = 0, bottom: i32 = 0 };
+    const POINT = extern struct { x: i32 = 0, y: i32 = 0 };
+    const MSG = extern struct {
+        hwnd: ?winapi.HWND = null,
+        message: u32 = 0,
+        wParam: usize = 0,
+        lParam: isize = 0,
+        time: u32 = 0,
+        pt: POINT = .{},
+        lPrivate: u32 = 0,
+    };
+    const BITMAPINFOHEADER = extern struct {
+        biSize: u32 = @sizeOf(BITMAPINFOHEADER),
+        biWidth: i32 = 0,
+        biHeight: i32 = 0,
+        biPlanes: u16 = 1,
+        biBitCount: u16 = 32,
+        biCompression: u32 = 0,
+        biSizeImage: u32 = 0,
+        biXPelsPerMeter: i32 = 0,
+        biYPelsPerMeter: i32 = 0,
+        biClrUsed: u32 = 0,
+        biClrImportant: u32 = 0,
+    };
+    const BITMAPINFO = extern struct { bmiHeader: BITMAPINFOHEADER = .{}, bmiColors: [1]u32 = .{0} };
+    const PAINTSTRUCT = extern struct {
+        hdc: ?*anyopaque = null,
+        fErase: i32 = 0,
+        rcPaint: RECT = .{},
+        fRestore: i32 = 0,
+        fIncUpdate: i32 = 0,
+        rgbReserved: [32]u8 = @splat(0),
+    };
+    const MINMAXINFO = extern struct { ptReserved: POINT = .{}, ptMaxSize: POINT = .{}, ptMaxPosition: POINT = .{}, ptMinTrackSize: POINT = .{}, ptMaxTrackSize: POINT = .{} };
+
+    extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?winapi.HINSTANCE;
+    extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
+    extern "kernel32" fn QueryPerformanceCounter(v: *i64) callconv(.winapi) i32;
+    extern "kernel32" fn QueryPerformanceFrequency(v: *i64) callconv(.winapi) i32;
+    extern "user32" fn RegisterClassW(c: *const WNDCLASSW) callconv(.winapi) u16;
+    extern "user32" fn CreateWindowExW(ex: u32, class: [*:0]const u16, title: [*:0]const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: ?winapi.HWND, menu: ?*anyopaque, inst: ?winapi.HINSTANCE, param: ?*anyopaque) callconv(.winapi) ?winapi.HWND;
+    extern "user32" fn DefWindowProcW(h: winapi.HWND, m: u32, w: usize, l: isize) callconv(.winapi) isize;
+    extern "user32" fn DestroyWindow(h: winapi.HWND) callconv(.winapi) i32;
+    extern "user32" fn ShowWindow(h: winapi.HWND, cmd: i32) callconv(.winapi) i32;
+    extern "user32" fn UpdateWindow(h: winapi.HWND) callconv(.winapi) i32;
+    extern "user32" fn GetClientRect(h: winapi.HWND, r: *RECT) callconv(.winapi) i32;
+    extern "user32" fn GetWindowRect(h: winapi.HWND, r: *RECT) callconv(.winapi) i32;
+    extern "user32" fn AdjustWindowRectEx(r: *RECT, style: u32, menu: i32, ex: u32) callconv(.winapi) i32;
+    extern "user32" fn GetDpiForWindow(h: winapi.HWND) callconv(.winapi) u32;
+    extern "user32" fn PeekMessageW(m: *MSG, h: ?winapi.HWND, min: u32, max: u32, remove: u32) callconv(.winapi) i32;
+    extern "user32" fn TranslateMessage(m: *const MSG) callconv(.winapi) i32;
+    extern "user32" fn DispatchMessageW(m: *const MSG) callconv(.winapi) isize;
+    extern "user32" fn MsgWaitForMultipleObjectsEx(count: u32, handles: ?*const anyopaque, ms: u32, wake: u32, flags: u32) callconv(.winapi) u32;
+    extern "user32" fn PostThreadMessageW(id: u32, msg: u32, w: usize, l: isize) callconv(.winapi) i32;
+    extern "user32" fn GetKeyState(vk: i32) callconv(.winapi) i16;
+    extern "user32" fn ScreenToClient(h: winapi.HWND, p: *POINT) callconv(.winapi) i32;
+    extern "user32" fn BeginPaint(h: winapi.HWND, ps: *PAINTSTRUCT) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn EndPaint(h: winapi.HWND, ps: *const PAINTSTRUCT) callconv(.winapi) i32;
+    extern "user32" fn SetWindowTextW(h: winapi.HWND, text: [*:0]const u16) callconv(.winapi) i32;
+    extern "user32" fn GetDC(h: winapi.HWND) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn ReleaseDC(h: winapi.HWND, dc: ?*anyopaque) callconv(.winapi) i32;
+    extern "user32" fn SetCursor(c: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn LoadCursorW(inst: ?winapi.HINSTANCE, name: usize) callconv(.winapi) ?*anyopaque;
+    extern "gdi32" fn SetDIBitsToDevice(dc: ?*anyopaque, x: i32, y: i32, w: u32, h: u32, sx: i32, sy: i32, start: u32, lines: u32, bits: *const anyopaque, bmi: *const BITMAPINFO, usage: u32) callconv(.winapi) i32;
+};
+
+var w32_class_registered: bool = false;
+var w32_instance: ?winapi.HINSTANCE = null;
+var w32_thread_id: u32 = 0;
+var w32_qpc_freq: i64 = 0;
+
+fn w32Init() void {
+    if (w32_class_registered) return;
+    w32_instance = w32.GetModuleHandleW(null);
+    w32_thread_id = w32.GetCurrentThreadId();
+    _ = w32.QueryPerformanceFrequency(&w32_qpc_freq);
+    const cls = std.unicode.utf8ToUtf16LeStringLiteral("nano_gui_win32");
+    const wc = w32.WNDCLASSW{ .lpfnWndProc = w32Proc, .hInstance = w32_instance, .lpszClassName = cls };
+    _ = w32.RegisterClassW(&wc);
+    w32_class_registered = true;
+}
+
+fn w32Find(hwnd: winapi.HWND) ?*Window {
+    for (headless_state.windows.items) |w| {
+        if (w.hwnd) |h| if (h == hwnd) return w;
+    }
+    return null;
+}
+
+fn w32Push(w: *Window, data: Data) void {
+    const e = Event{ .window = w, .time_ms = nowMs(), .data = data };
+    headless_state.events.append(headless_state.gpa, e) catch {};
+}
+
+fn w32Mods() Mods {
+    return .{
+        .shift = (@as(u16, @bitCast(w32.GetKeyState(0x10))) & 0x8000) != 0,
+        .ctrl = (@as(u16, @bitCast(w32.GetKeyState(0x11))) & 0x8000) != 0,
+        .alt = (@as(u16, @bitCast(w32.GetKeyState(0x12))) & 0x8000) != 0,
+        .win = ((@as(u16, @bitCast(w32.GetKeyState(0x5B))) | @as(u16, @bitCast(w32.GetKeyState(0x5C)))) & 0x8000) != 0,
+    };
+}
+
+fn w32Proc(hwnd: winapi.HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
+    const w = w32Find(hwnd) orelse return w32.DefWindowProcW(hwnd, msg, wp, lp);
+    const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lp))))));
+    const y: i32 = @as(i16, @bitCast(@as(u16, @truncate((@as(usize, @bitCast(lp)) >> 16)))));
+    switch (msg) {
+        w32.WM_MOUSEMOVE => w32Push(w, .{ .mouse_move = .{ .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
+        w32.WM_LBUTTONDOWN, w32.WM_LBUTTONUP => w32Push(w, .{ .mouse_button = .{ .button = .left, .down = msg == w32.WM_LBUTTONDOWN, .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
+        w32.WM_RBUTTONDOWN, w32.WM_RBUTTONUP => w32Push(w, .{ .mouse_button = .{ .button = .right, .down = msg == w32.WM_RBUTTONDOWN, .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
+        w32.WM_MBUTTONDOWN, w32.WM_MBUTTONUP => w32Push(w, .{ .mouse_button = .{ .button = .middle, .down = msg == w32.WM_MBUTTONDOWN, .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
+        w32.WM_MOUSEWHEEL => {
+            var pt = w32.POINT{ .x = x, .y = y };
+            _ = w32.ScreenToClient(hwnd, &pt);
+            const raw: i16 = @bitCast(@as(u16, @truncate((wp >> 16))));
+            w32Push(w, .{ .wheel = .{ .axis = .vertical, .raw = raw, .steps = @divTrunc(raw, 120), .pos = .{ .x = pt.x, .y = pt.y }, .mods = w32Mods() } });
+        },
+        w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN, w32.WM_KEYUP, w32.WM_SYSKEYUP => {
+            const down = msg == w32.WM_KEYDOWN or msg == w32.WM_SYSKEYDOWN;
+            const vk: u16 = @truncate(wp & 0xFFFF);
+            const lp_u: usize = @bitCast(lp);
+            if (std.enums.fromInt(VirtualKey, vk)) |key| {
+                w32Push(w, .{ .key = .{ .vk = key, .scancode = @truncate(lp_u), .down = down, .repeat = ((lp_u >> 30) & 1) != 0, .mods = w32Mods(), .extended = ((lp_u >> 24) & 1) != 0 } });
+            }
+        },
+        w32.WM_CHAR => {
+            const cp: u21 = @intCast(@as(u16, @truncate(wp & 0xFFFF)));
+            if (cp >= 0x20 and cp != 0x7F) {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
+                if (n > 0) {
+                    const copy = headless_state.gpa.dupe(u8, buf[0..n]) catch return 0;
+                    w32Push(w, .{ .text = copy });
+                }
+            }
+        },
+        w32.WM_SETFOCUS => w32Push(w, .{ .focus = .{ .gained = true } }),
+        w32.WM_KILLFOCUS => w32Push(w, .{ .focus = .{ .gained = false } }),
+        w32.WM_ACTIVATE => w32Push(w, .{ .activate = .{ .active = (wp & 0xFFFF) != 0, .by_click = (wp >> 16) == 2 } }),
+        w32.WM_SIZE => {
+            var r: w32.RECT = .{};
+            _ = w32.GetClientRect(hwnd, &r);
+            w.client = .{ .w = r.right - r.left, .h = r.bottom - r.top };
+            w32Push(w, .{ .resized = .{ .client = w.client, .state = if (r.right - r.left == 0) .minimized else .normal } });
+            if (w.frame_callback) |cb| cb(w, .size);
+        },
+        w32.WM_DPICHANGED => {
+            const dpi: u32 = @truncate(wp & 0xFFFF);
+            w.dpi = dpi;
+            w.scale_value = @as(f32, @floatFromInt(dpi)) / 96.0;
+            w32Push(w, .{ .dpi_changed = .{ .dpi = dpi, .scale = w.scale_value } });
+        },
+        w32.WM_PAINT => {
+            var ps: w32.PAINTSTRUCT = .{};
+            _ = w32.BeginPaint(hwnd, &ps);
+            w32Push(w, .{ .repaint = .{ .rect = .{ .x = 0, .y = 0, .w = w.client.w, .h = w.client.h } } });
+            _ = w32.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        w32.WM_ERASEBKGND => return 1,
+        w32.WM_CLOSE => {
+            w32Push(w, .close_requested);
+            return 0;
+        },
+        w32.WM_DESTROY => {
+            w32Push(w, .{ .visibility = .{ .visible = false } });
+        },
+        w32.WM_GETMINMAXINFO => {},
+        else => {},
+    }
+    return w32.DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+fn w32CreateWindow(opts: WindowOptions) !*Window {
+    w32Init();
+    const w = try headless_state.gpa.create(Window);
+    w.* = .{
+        .id = headless_state.next_id,
+        .title = opts.title,
+        .client = .{ .w = @intFromFloat(@round(opts.client_size.w)), .h = @intFromFloat(@round(opts.client_size.h)) },
+        .visible = !opts.hidden,
+        .dpi = 96,
+    };
+    headless_state.next_id += 1;
+    var r = w32.RECT{ .left = 0, .top = 0, .right = w.client.w, .bottom = w.client.h };
+    _ = w32.AdjustWindowRectEx(&r, 0x00CF0000, 0, 0);
+    const title_z = try std.unicode.utf8ToUtf16LeAllocZ(headless_state.gpa, opts.title);
+    defer headless_state.gpa.free(title_z);
+    const cls = std.unicode.utf8ToUtf16LeStringLiteral("nano_gui_win32");
+    const hwnd = w32.CreateWindowExW(0, cls, title_z.ptr, 0x00CF0000, w32.CW_USEDEFAULT, w32.CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, null, null, w32_instance, null) orelse return error.CreateWindowFailed;
+    w.hwnd = hwnd;
+    const dpi = w32.GetDpiForWindow(hwnd);
+    if (dpi != 0) {
+        w.dpi = dpi;
+        w.scale_value = @as(f32, @floatFromInt(dpi)) / 96.0;
+    }
+    try headless_state.windows.append(headless_state.gpa, w);
+    if (!opts.hidden) {
+        _ = w32.ShowWindow(hwnd, 5);
+        _ = w32.UpdateWindow(hwnd);
+    }
+    return w;
+}
+
+fn w32Pump() usize {
+    var msg: w32.MSG = .{};
+    var n: usize = 0;
+    while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+        _ = w32.TranslateMessage(&msg);
+        _ = w32.DispatchMessageW(&msg);
+        n += 1;
+    }
+    return n;
+}
+
+fn w32Wait(timeout_ms: ?u32) WaitResult {
+    const ms: u32 = if (timeout_ms) |v| v else 0xFFFFFFFF;
+    const r = w32.MsgWaitForMultipleObjectsEx(0, null, ms, w32.QS_ALLINPUT, w32.MWMO_INPUTAVAILABLE);
+    if (r == 0) return .message;
+    if (r == 258) return .timeout;
+    return .idle;
+}
+
+fn w32Now() u64 {
+    var c: i64 = 0;
+    _ = w32.QueryPerformanceCounter(&c);
+    if (w32_qpc_freq == 0) return @intCast(@divTrunc(c, 1000));
+    return @intCast(@divTrunc(c * 1000, w32_qpc_freq));
+}
+
+fn w32Present(w: *Window) void {
+    const hwnd = w.hwnd orelse return;
+    if (w.present_rgba.len == 0 or w.present_w == 0 or w.present_h == 0) return;
+    const dc = w32.GetDC(hwnd) orelse return;
+    defer _ = w32.ReleaseDC(hwnd, dc);
+    var bmi = w32.BITMAPINFO{};
+    bmi.bmiHeader.biWidth = @intCast(w.present_w);
+    bmi.bmiHeader.biHeight = -@as(i32, @intCast(w.present_h));
+    var buf = headless_state.gpa.alloc(u8, w.present_rgba.len) catch return;
+    defer headless_state.gpa.free(buf);
+    var i: usize = 0;
+    while (i < w.present_rgba.len / 4) : (i += 1) {
+        const o = i * 4;
+        buf[o] = w.present_rgba[o + 2];
+        buf[o + 1] = w.present_rgba[o + 1];
+        buf[o + 2] = w.present_rgba[o];
+        buf[o + 3] = 0;
+    }
+    _ = w32.SetDIBitsToDevice(dc, 0, 0, w.present_w, w.present_h, 0, 0, 0, w.present_h, buf.ptr, &bmi, 0);
 }

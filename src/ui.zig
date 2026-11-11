@@ -1974,7 +1974,12 @@ pub const Ui = struct {
         }
         surface.endFrame();
         surface.present();
-        if (self.window) |w| platform.present(w);
+        if (self.window) |w| {
+            w.present_rgba = surface.presented;
+            w.present_w = surface.width;
+            w.present_h = surface.height;
+            platform.present(w);
+        }
         self.dirty = .none;
         self.frame_count += 1;
         _ = core.stats.gauge("frame.damage_area");
