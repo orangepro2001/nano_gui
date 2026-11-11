@@ -242,6 +242,8 @@ extern "gdi32" fn CreateCompatibleDC(hdc: ?*anyopaque) callconv(.winapi) ?*anyop
 extern "gdi32" fn DeleteDC(hdc: ?*anyopaque) callconv(.winapi) i32;
 extern "gdi32" fn GetCurrentObject(hdc: ?*anyopaque, ty: u32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn GetDIBits(hdc: ?*anyopaque, bmp: ?*anyopaque, start: u32, lines: u32, bits: ?*anyopaque, bmi: *const BitmapInfo, usage: u32) callconv(.winapi) i32;
+extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
+extern "gdi32" fn GetBitmapBits(bmp: ?*anyopaque, count: i32, bits: ?*anyopaque) callconv(.winapi) i32;
 
 const BitmapInfoHeader = extern struct {
     biSize: u32 = @sizeOf(BitmapInfoHeader),
@@ -301,7 +303,11 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     var bmi = BitmapInfo{};
     bmi.bmiHeader.biWidth = @intCast(w);
     bmi.bmiHeader.biHeight = -@as(i32, @intCast(h));
-    if (GetDIBits(memdc, bmp, 0, h, bits.ptr, &bmi, 0) == 0) return error.DirectWriteFailed;
+    _ = GdiFlush();
+    const got = GetDIBits(memdc, bmp, 0, h, bits.ptr, &bmi, 0);
+    if (got == 0) {
+        _ = GetBitmapBits(bmp, @intCast(@as(usize, w) * h * 4), bits.ptr);
+    }
     var dbg_nonzero: usize = 0;
     for (bits) |b| if (b != 0) {
         dbg_nonzero += 1;
