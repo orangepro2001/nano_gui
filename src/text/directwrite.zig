@@ -40,26 +40,11 @@ const IDWriteTextLayout = extern struct {
         QueryInterface: *const fn (*anyopaque, *const winapi.GUID, *?*anyopaque) callconv(.winapi) i32,
         AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
         Release: *const fn (*anyopaque) callconv(.winapi) u32,
-        SetTextAlignment: *const fn () callconv(.winapi) void,
-        SetParagraphAlignment: *const fn () callconv(.winapi) void,
-        SetWordWrapping: *const fn () callconv(.winapi) void,
-        SetReadingDirection: *const fn () callconv(.winapi) void,
-        SetFlowDirection: *const fn () callconv(.winapi) void,
-        SetIncrementalTabStop: *const fn () callconv(.winapi) void,
-        SetTrimming: *const fn () callconv(.winapi) void,
-        SetLineSpacing: *const fn () callconv(.winapi) void,
-        SetFontSize: *const fn () callconv(.winapi) void,
-        SetFontFamilyName: *const fn () callconv(.winapi) void,
-        SetFontWeight: *const fn () callconv(.winapi) void,
-        SetFontStyle: *const fn () callconv(.winapi) void,
-        SetFontStretch: *const fn () callconv(.winapi) void,
-        SetFontCollection: *const fn () callconv(.winapi) void,
-        SetLocaleName: *const fn () callconv(.winapi) void,
-        GetMaxWidth: *const fn () callconv(.winapi) void,
-        GetMaxHeight: *const fn () callconv(.winapi) void,
-        SetMaxWidth: *const fn () callconv(.winapi) void,
-        SetMaxHeight: *const fn () callconv(.winapi) void,
+        /// IDWriteTextFormat 的 25 个方法 + layout 的 Set*/Get*/Draw/GetLineMetrics 等，
+        /// 直到 GetMetrics 之前的全部槽位（顺序以 dwrite.h 为准）。
+        before_metrics: [57]*const fn () callconv(.winapi) void,
         GetMetrics: *const fn (*anyopaque, *TextMetrics) callconv(.winapi) i32,
+        after_metrics: [6]*const fn () callconv(.winapi) void,
     };
 };
 
