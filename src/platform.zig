@@ -684,11 +684,15 @@ pub fn init(allocator: std.mem.Allocator) !void {
 }
 
 pub fn deinit() void {
+    if (!headless_state.initialized) return;
+    headless_state.initialized = false;
     for (headless_state.windows.items) |w| headless_state.gpa.destroy(w);
     headless_state.windows.deinit(headless_state.gpa);
+    headless_state.windows = .empty;
     headless_state.events.deinit(headless_state.gpa);
+    headless_state.events = .empty;
     headless_state.clipboard_text.deinit(headless_state.gpa);
-    headless_state.initialized = false;
+    headless_state.clipboard_text = .empty;
 }
 
 pub fn createWindow(opts: WindowOptions) !*Window {
@@ -763,16 +767,17 @@ pub fn pumpMessages(sink: EventSink) usize {
     return n;
 }
 
-pub const WaitResult = enum { message, woken, timeout };
+pub const WaitResult = enum { message, woken, timeout, idle };
 
 pub fn waitMessages(timeout_ms: ?u32) WaitResult {
-    _ = timeout_ms;
     if (headless_state.events.items.len > 0) return .message;
-    if (headless_state.wake_flag) {
-        headless_state.wake_flag = false;
-        return .woken;
+    if (headless_state.wake_flag.swap(false, .acq_rel)) return .woken;
+    if (timeout_ms) |ms| {
+        // 无头/假时钟：超时立即到达并推进注入时钟（AC-PLAT-012）。
+        if (injected_clock == null) headless_state.now_ms +%= ms;
+        return .timeout;
     }
-    return .timeout;
+    return .idle;
 }
 
 pub fn wake() void {

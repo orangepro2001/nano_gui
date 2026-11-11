@@ -107,6 +107,7 @@ const StateSlot = struct {
     level: Retain,
     touched: u64,
     last_touch: u64 = 0,
+    serial: u64 = 0,
     deinit_fn: ?*const fn (data: *anyopaque, allocator: std.mem.Allocator) void,
     destroy_fn: ?*const fn (data: *anyopaque, allocator: std.mem.Allocator) void,
     allocator: std.mem.Allocator,
@@ -166,7 +167,6 @@ pub const Ui = struct {
     overlays: std.ArrayListUnmanaged(OverlaySpec) = .empty,
     prev_overlays: std.ArrayListUnmanaged(OverlaySpec) = .empty,
     states: std.AutoHashMapUnmanaged(StateKey, *StateSlot) = .empty,
-    sticky_order: std.ArrayListUnmanaged(StateKey) = .empty,
     anims: std.AutoHashMapUnmanaged(u64, Anim) = .empty,
     timers: std.AutoHashMapUnmanaged(u64, Timer) = .empty,
     inbox: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(input.NodeEvent)) = .empty,
@@ -222,6 +222,7 @@ pub const Ui = struct {
     ime_buffer: std.ArrayListUnmanaged(u8) = .empty,
     built_this_frame: bool = false,
     sticky_limit: usize = 4096,
+    state_serial: u64 = 0,
     open_menu: core.WidgetId = .none,
     popup_rect: ?core.RectI = null,
     aux_ptr: ?*anyopaque = null,
@@ -229,6 +230,7 @@ pub const Ui = struct {
 
     pub fn init(gpa: std.mem.Allocator) Ui {
         core.stats.initRegistry();
+        text.init(gpa, .{}) catch {};
         return .{
             .gpa = gpa,
             .frame = core.FrameArena.init(gpa),
@@ -247,7 +249,6 @@ pub const Ui = struct {
         var iit = self.inbox.valueIterator();
         while (iit.next()) |list| list.deinit(self.gpa);
         self.states.deinit(self.gpa);
-        self.sticky_order.deinit(self.gpa);
         self.anims.deinit(self.gpa);
         self.timers.deinit(self.gpa);
         self.inbox.deinit(self.gpa);
@@ -578,6 +579,8 @@ pub const Ui = struct {
         if (self.states.get(key)) |slot| {
             slot.touched = self.build_counter;
             slot.last_touch = self.build_counter;
+            self.state_serial += 1;
+            slot.serial = self.state_serial;
             return @ptrCast(@alignCast(slot.data));
         }
         const ptr = self.gpa.create(T) catch @panic("nano_gui: state allocation failed");
@@ -590,6 +593,10 @@ pub const Ui = struct {
             .level = level,
             .touched = self.build_counter,
             .last_touch = self.build_counter,
+            .serial = blk: {
+                self.state_serial += 1;
+                break :blk self.state_serial;
+            },
             .deinit_fn = null,
             .destroy_fn = struct {
                 fn destroy(data: *anyopaque, alloc: std.mem.Allocator) void {
@@ -600,7 +607,6 @@ pub const Ui = struct {
             .allocator = self.gpa,
         };
         self.states.put(self.gpa, key, slot) catch {};
-        self.sticky_order.append(self.gpa, key) catch {};
         return ptr;
     }
 
@@ -617,6 +623,8 @@ pub const Ui = struct {
         if (self.states.get(key)) |slot| {
             slot.touched = self.build_counter;
             slot.last_touch = self.build_counter;
+            self.state_serial += 1;
+            slot.serial = self.state_serial;
             return @ptrCast(@alignCast(slot.data));
         }
         const ptr = self.gpa.create(T) catch @panic("nano_gui: retained allocation failed");
@@ -629,6 +637,10 @@ pub const Ui = struct {
             .level = level,
             .touched = self.build_counter,
             .last_touch = self.build_counter,
+            .serial = blk: {
+                self.state_serial += 1;
+                break :blk self.state_serial;
+            },
             .deinit_fn = struct {
                 fn deinit(data: *anyopaque, _: std.mem.Allocator) void {
                     const p: *T = @ptrCast(@alignCast(data));
@@ -644,7 +656,6 @@ pub const Ui = struct {
             .allocator = self.gpa,
         };
         self.states.put(self.gpa, key, slot) catch {};
-        self.sticky_order.append(self.gpa, key) catch {};
         return ptr;
     }
 
@@ -1418,17 +1429,20 @@ pub const Ui = struct {
         // sticky LRU：超过上限时回收最久未触达且本次未触达的槽（pinned 不回收）。
         var sticky_count: usize = 0;
         var sit2 = self.states.valueIterator();
-        while (sit2.next()) |slot| if (slot.*.level != .transient) {
+        while (sit2.next()) |slot| if (slot.*.level == .sticky) {
             sticky_count += 1;
         };
         while (sticky_count > self.sticky_limit) {
             var victim: ?StateKey = null;
             var oldest: u64 = std.math.maxInt(u64);
+            var oldest_serial: u64 = std.math.maxInt(u64);
             var vit = self.states.iterator();
             while (vit.next()) |kv| {
                 const slot = kv.value_ptr.*;
-                if (slot.level == .sticky and slot.touched != self.build_counter and slot.last_touch < oldest) {
+                if (slot.level != .sticky or slot.touched == self.build_counter) continue;
+                if (slot.last_touch < oldest or (slot.last_touch == oldest and slot.serial < oldest_serial)) {
                     oldest = slot.last_touch;
+                    oldest_serial = slot.serial;
                     victim = kv.key_ptr.*;
                 }
             }

@@ -253,6 +253,41 @@ test "integration: frame ids, click, transient state" {
     u.beginFrame(232, true);
     const st2 = u.state(u32, id, 1);
     try std.testing.expectEqual(@as(u32, 1), st2.*);
+
+    // AC-PLAT-012：超时推进假时钟、无限等待返回 idle、wake 合并。
+    const t_before = platform.nowMs();
+    try std.testing.expectEqual(platform.WaitResult.timeout, platform.waitMessages(100));
+    try std.testing.expectEqual(t_before + 100, platform.nowMs());
+    try std.testing.expectEqual(platform.WaitResult.idle, platform.waitMessages(null));
+    const W = struct {
+        fn run() void {
+            platform.wake();
+        }
+    };
+    const wake_thread = try std.Thread.spawn(.{}, W.run, .{});
+    wake_thread.join();
+    try std.testing.expectEqual(platform.WaitResult.woken, platform.waitMessages(null));
+    var k: usize = 0;
+    while (k < 1000) : (k += 1) platform.wake();
+    try std.testing.expectEqual(platform.WaitResult.woken, platform.waitMessages(null));
+    try std.testing.expectEqual(platform.WaitResult.idle, platform.waitMessages(null));
+
+    // AC-ARCH-005：App.post 必须按入队顺序执行。
+    var posted = nano.app.App.init(std.testing.allocator, .{ .size = .{ .w = 200, .h = 120 } }) catch return error.TestUnexpectedResult;
+    defer posted.deinit();
+    const Order = struct {
+        var seen: [4]u32 = @splat(0);
+        var n: usize = 0;
+        fn push(ctx: ?*anyopaque) void {
+            const v: *u32 = @ptrCast(@alignCast(ctx.?));
+            seen[n] = v.*;
+            n += 1;
+        }
+    };
+    var vals = [3]u32{ 1, 2, 3 };
+    for (&vals) |*v| _ = posted.post(.{ .ctx = v, .func = Order.push });
+    _ = posted.pump();
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, Order.seen[0..3]);
 }
 
 const PinnedState = struct {
@@ -263,7 +298,7 @@ const PinnedState = struct {
     pub fn deinit(_: *PinnedState) void {}
 };
 
-test "AC-FRAME-010 sticky LRU and pinned retention" {
+test "AC-FRAME-005 sticky LRU and pinned retention" {
     var u = ui.Ui.init(std.testing.allocator);
     defer u.deinit();
     const pinned_id = core.WidgetId.fromHash(0x7777);
@@ -278,6 +313,8 @@ test "AC-FRAME-010 sticky LRU and pinned retention" {
     u.finishFrame();
     try std.testing.expect(u.stateSlotCount() <= 4097);
     try std.testing.expect(u.getState(PinnedState, pinned_id) != null);
+    try std.testing.expect(u.getState(u32, core.WidgetId.fromHash(10000)) == null);
+    try std.testing.expect(u.getState(u32, core.WidgetId.fromHash(10904)) != null);
 }
 
 test "AC-LAYOUT-001/002 distribute edge cases" {

@@ -8,6 +8,13 @@ const std = @import("std");
 const core = @import("core.zig");
 const platform = @import("platform.zig");
 
+var gfx_allocator: std.mem.Allocator = std.heap.page_allocator;
+
+/// 注入持久分配器（由 App 在初始化时调用）。
+pub fn init(allocator: std.mem.Allocator) void {
+    gfx_allocator = allocator;
+}
+
 pub const TextureId = enum(u32) { none = 0, _ };
 pub const ImageId = enum(u32) { none = 0, _ };
 pub const TextureFormat = enum { a8, rgba8 };
@@ -97,7 +104,7 @@ pub fn createTexture(w: u32, h: u32, fmt: TextureFormat, usage: TextureUsage) Gf
             textures[i].h = h;
             textures[i].fmt = fmt;
             textures[i].data.clearRetainingCapacity();
-            textures[i].data.appendNTimes(std.heap.page_allocator, 0, @as(usize, w) * h * bpp) catch return error.OutOfMemory;
+            textures[i].data.appendNTimes(gfx_allocator, 0, @as(usize, w) * h * bpp) catch return error.OutOfMemory;
             const id: u32 = next_texture;
             next_texture += 1;
             return @fromBackingInt(@intCast((id << 8) | @as(u32, @intCast(i + 1))));
@@ -193,7 +200,7 @@ pub const images = struct {
         return null;
     }
     pub fn loadSync(key: ImageKey, bytes: []const u8) GfxError!ImageId {
-        const pix = decode(std.heap.page_allocator, bytes) catch return error.InvalidHandle;
+        const pix = decode(gfx_allocator, bytes) catch return error.InvalidHandle;
         return insert(key, pix, .{});
     }
     pub fn insert(key: ImageKey, pixels: Pixels, opts: struct { pinned: bool = false, mip: bool = false }) GfxError!ImageId {

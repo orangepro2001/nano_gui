@@ -539,8 +539,9 @@ fn paintToggle(ctx: *PaintCtx, node: *const Node) void {
             const track = core.Rect{ .x = r.x, .y = r.y + (r.h - sh) * 0.5, .w = sw, .h = sh };
             ctx.draw.canvas.fillRoundRect(track, t.metric(.radius_control), if (p.checked) t.color(.accent_fill_bottom) else t.color(.surface_track));
             ctx.draw.canvas.strokeRoundRect(track, t.metric(.radius_control), if (v.hovered) t.color(.border_control_hover) else t.color(.border_control), t.hairline(ctx.draw.scale));
-            const thumb_w = sh - 4;
-            const thumb = core.Rect{ .x = if (p.checked) track.right() - thumb_w - 2 else track.x + 2, .y = track.y + 2, .w = thumb_w, .h = thumb_w };
+            const hair = @as(f32, @floatFromInt(t.hairline(ctx.draw.scale)));
+            const thumb_w = @max(1, sh - hair * 2);
+            const thumb = core.Rect{ .x = if (p.checked) track.right() - thumb_w - hair else track.x + hair, .y = track.y + hair, .w = thumb_w, .h = thumb_w };
             ctx.draw.canvas.fillRoundRect(thumb, t.metric(.radius_mark), t.color(.surface_raised_hover_top));
             if (v.focused_visible) theme.drawFocusRing(&ctx.draw, track, .radius_control, v);
             if (p.label.len > 0) text.draw(ctx.draw.canvas, p.tl, .{ .x = r.x + sw + t.metric(.gap_sm), .y = r.y + (r.h - p.tl.size.h) * 0.5 }, if (v.disabled) t.color(.text_disabled) else t.color(.text_primary), .{});
@@ -1132,7 +1133,7 @@ fn paintToolbar(ctx: *PaintCtx, node: *const Node) void {
 
 pub const StatusBarOptions = struct { key: ?ui.Key = null, debug_name: ?[]const u8 = null, gap: theme.Gap = .md, padding: f32 = 6 };
 pub fn beginStatusBar(ui_ptr: *Ui, src: std.builtin.SourceLocation, opts: StatusBarOptions) core.WidgetId {
-    const o = layout.ContainerOptions{ .debug_name = opts.debug_name, .main = .fixedSize(ui_ptr.theme_ptr.metric(.control_h_sm)), .cross = .fill, .padding = core.Insets.symmetric(opts.padding, 2), .gap = opts.gap, .cross_align = .center };
+    const o = layout.ContainerOptions{ .debug_name = opts.debug_name, .main = .fixedSize(ui_ptr.theme_ptr.metric(.control_h_sm)), .cross = .fill, .padding = core.Insets.symmetric(opts.padding, ui_ptr.theme_ptr.metric(.gap_xs)), .gap = opts.gap, .cross_align = .center };
     const id = ui_ptr.beginRow(src, o);
     if (ui_ptr.getNode(id)) |n| {
         n.paint = paintToolbar;
@@ -1217,6 +1218,7 @@ pub const TextInputResult = struct {
 
 const TextInputState = struct {
     caret: usize = 0,
+    anchor: usize = 0,
 };
 
 const TextInputProps = struct {
@@ -1727,6 +1729,8 @@ pub const TextAreaResult = struct {
     changed: bool = false,
 };
 
+const TextSub = struct { f: ChangeFn, ctx: ?*anyopaque };
+
 pub const TextAreaState = struct {
     buf: TextBuf,
     caret: usize = 0,
@@ -1734,12 +1738,27 @@ pub const TextAreaState = struct {
     modified: bool = false,
     eol: Eol = .lf,
     had_bom: bool = false,
+    subs: std.ArrayListUnmanaged(TextSub) = .empty,
+    owner_allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TextAreaState {
-        return .{ .buf = TextBuf.init(allocator) };
+        return .{ .buf = TextBuf.init(allocator), .owner_allocator = allocator };
     }
     pub fn deinit(self: *TextAreaState) void {
         self.buf.deinit();
+        self.subs.deinit(self.owner_allocator);
+    }
+    pub fn notify(self: *TextAreaState, start: u64, removed: u64, inserted: u64, source: ChangeSource) void {
+        for (self.subs.items) |sub| {
+            sub.f(sub.ctx, .{
+                .start = start,
+                .removed = removed,
+                .inserted = inserted,
+                .source = source,
+                .revision = self.buf.revision(),
+                .line = 0,
+            });
+        }
     }
 };
 
@@ -1875,6 +1894,7 @@ pub fn textArea(ui_ptr: *Ui, src: std.builtin.SourceLocation, opts: TextAreaOpti
             else => {},
         };
     }
+    if (res.changed) st.notify(@intCast(st.caret), 0, 0, .user);
     res.caret = st.caret;
     res.selection = .{ .start = @min(st.caret, st.anchor), .end = @max(st.caret, st.anchor) };
     return res;
@@ -2913,15 +2933,26 @@ pub fn sliderInt(ui_ptr: *Ui, src: std.builtin.SourceLocation, value: *i32, opts
     return r;
 }
 
-pub fn comboBoxEditable(ui_ptr: *Ui, src: std.builtin.SourceLocation, text_buf: *TextBuf, _: ItemSource, opts: ComboBoxEditableOptions) ComboBoxResult {
+pub fn comboBoxEditable(ui_ptr: *Ui, src: std.builtin.SourceLocation, text_buf: *TextBuf, items: ItemSource, opts: ComboBoxEditableOptions) ComboBoxResult {
+    _ = ui_ptr.beginRow(src, .{ .main = .fit, .cross = .fit, .gap = .xs, .cross_align = .center });
     const r = textInput(ui_ptr, src, text_buf, .{
         .key = opts.key,
         .debug_name = opts.debug_name,
         .enabled = opts.enabled,
         .placeholder = opts.placeholder orelse "",
-        .layout = opts.layout,
+        .layout = .{ .main = .{ .grow = 1 }, .cross = .fill },
     });
-    return .{ .hovered = r.hovered, .focused = r.focused, .changed = r.changed, .committed = r.committed };
+    const idx = ui_ptr.stateSticky(usize, ui_ptr.id(src, opts.key), 0);
+    const picker = button(ui_ptr, @src(), "v", .{ .variant = .quiet, .enabled = opts.enabled });
+    ui_ptr.endRow();
+    var res = ComboBoxResult{ .id = ui_ptr.id(src, opts.key), .hovered = r.hovered, .focused = r.focused, .changed = r.changed, .committed = r.committed };
+    if (picker.clicked and items.count() > 0) {
+        idx.* = (idx.* + 1) % items.count();
+        text_buf.set(items.textAt(@intCast(idx.*), ui_ptr.treeAlloc())) catch {};
+        res.changed = true;
+        res.picked = @intCast(idx.*);
+    }
+    return res;
 }
 
 pub const ComboBoxEditableOptions = struct {
@@ -2988,6 +3019,23 @@ pub const StatusPaneOptions = struct {
 };
 pub const StatusPaneResult = struct { hovered: bool = false, clicked: bool = false };
 
+pub fn beginStatusPane(ui_ptr: *Ui, src: std.builtin.SourceLocation, opts: StatusPaneOptions) core.WidgetId {
+    var item = opts.layout;
+    if (opts.grow > 0) item.main = .{ .grow = opts.grow };
+    if (opts.width) |w| item.main = .fixedSize(w);
+    const o = layout.ContainerOptions{
+        .debug_name = opts.debug_name,
+        .main = item.main orelse .fit,
+        .cross = item.cross orelse .fill,
+        .gap = .xs,
+        .cross_align = .center,
+    };
+    return ui_ptr.beginRow(src, o);
+}
+pub fn endStatusPane(ui_ptr: *Ui) void {
+    ui_ptr.endRow();
+}
+
 pub fn statusPane(ui_ptr: *Ui, src: std.builtin.SourceLocation, label_text: []const u8, opts: StatusPaneOptions) StatusPaneResult {
     var item = opts.layout;
     if (opts.grow > 0) item.main = .{ .grow = opts.grow };
@@ -2997,6 +3045,10 @@ pub fn statusPane(ui_ptr: *Ui, src: std.builtin.SourceLocation, label_text: []co
 }
 
 pub fn tooltipIfTruncated(ui_ptr: *Ui, src: std.builtin.SourceLocation, owner: core.WidgetId, label_text: []const u8, opts: TooltipOptions) TooltipResult {
+    const node = ui_ptr.getPrevNode(owner) orelse return .{};
+    const avail = @as(f32, @floatFromInt(node.abs.w)) / ui_ptr.scale;
+    const needed = text.measure(label_text, ui_ptr.theme_ptr.fonts.get(.body), ui_ptr.scale, .{}).w;
+    if (needed <= avail) return .{};
     return tooltip(ui_ptr, src, owner, label_text, opts);
 }
 
@@ -3005,28 +3057,39 @@ pub const Change = struct { start: u64, removed: u64, inserted: u64, source: Cha
 pub const ChangeFn = *const fn (ctx: ?*anyopaque, change: Change) void;
 pub const Subscription = enum(u32) { none = 0, _ };
 
-pub fn textAreaSubscribe(_: *Ui, _: TextAreaHandle, _: ChangeFn, _: ?*anyopaque) error{OutOfMemory}!Subscription {
-    return .none;
+pub fn textAreaSubscribe(ui_ptr: *Ui, h: TextAreaHandle, f: ChangeFn, ctx: ?*anyopaque) error{OutOfMemory}!Subscription {
+    const st = ui_ptr.retained(TextAreaState, h.id, .pinned);
+    try st.subs.append(st.owner_allocator, .{ .f = f, .ctx = ctx });
+    return @fromBackingInt(@intCast(@as(u32, @intCast(st.subs.items.len))));
 }
-pub fn textAreaUnsubscribe(_: *Ui, _: TextAreaHandle, _: Subscription) void {}
+pub fn textAreaUnsubscribe(ui_ptr: *Ui, h: TextAreaHandle, s: Subscription) void {
+    const st = ui_ptr.retained(TextAreaState, h.id, .pinned);
+    const idx: usize = @backingInt(s);
+    if (idx == 0 or idx > st.subs.items.len) return;
+    _ = st.subs.orderedRemove(idx - 1);
+}
 
-pub fn textInputSetSelection(ui_ptr: *Ui, id: core.WidgetId, _: u32, caret: u32) void {
+pub fn textInputSetSelection(ui_ptr: *Ui, id: core.WidgetId, anchor: u32, caret: u32) void {
     const st = ui_ptr.stateSticky(TextInputState, id, .{});
+    st.anchor = anchor;
     st.caret = caret;
 }
 
 // 文档容器形式的标签页入口（内部复用 tabs 叶节点；内容由调用方在 endTabs 前声明）。
 pub const TabSpec = struct { label: []const u8, icon: ?theme.Icon = null, closable: bool = false };
 pub fn beginTabs(ui_ptr: *Ui, src: std.builtin.SourceLocation, tabs_spec: []const TabSpec, current: *usize, opts: TabsOptions) TabsResult {
+    _ = ui_ptr.beginColumn(src, .{ .main = .{ .grow = 1 }, .cross = .fill, .gap = .none });
     const labels = ui_ptr.treeAlloc().alloc([]const u8, tabs_spec.len) catch return .{};
     for (tabs_spec, 0..) |t, i| labels[i] = t.label;
     var o = opts;
     o.items = labels;
     o.selected = current;
-    return tabs(ui_ptr, src, o);
+    return tabs(ui_ptr, @src(), o);
 }
 pub fn beginTabsRetained(ui_ptr: *Ui, src: std.builtin.SourceLocation, tabs_spec: []const TabSpec, initial: usize, opts: TabsOptions) TabsResult {
     const cur = ui_ptr.stateSticky(usize, ui_ptr.id(src, opts.key), initial);
     return beginTabs(ui_ptr, src, tabs_spec, cur, opts);
 }
-pub fn endTabs(_: *Ui) void {}
+pub fn endTabs(ui_ptr: *Ui) void {
+    ui_ptr.endColumn();
+}

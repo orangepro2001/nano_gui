@@ -13,15 +13,19 @@ fn collect(allocator: std.mem.Allocator, io: std.Io) ![]Entry {
     defer walker.deinit();
     while (try walker.next(io)) |e| {
         if (e.kind != .file) continue;
+        if (e.basename.len == 0 or e.basename[0] == '.') continue;
+        if (std.mem.endsWith(u8, e.basename, ".swp")) continue;
+        if (std.mem.endsWith(u8, e.basename, "~")) continue;
         const bytes = try e.dir.readFileAlloc(io, e.basename, allocator, .unlimited);
         defer allocator.free(bytes);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         const hex = std.fmt.bytesToHex(hash, .lower);
-        try list.append(allocator, .{
-            .path = try std.fs.path.join(allocator, &.{ "docs", e.path }),
-            .hex = hex,
-        });
+        const rel = try allocator.alloc(u8, e.path.len);
+        for (e.path, 0..) |ch, i| rel[i] = if (ch == '\\') '/' else ch;
+        const full = try std.mem.concat(allocator, u8, &.{ "docs/", rel });
+        allocator.free(rel);
+        try list.append(allocator, .{ .path = full, .hex = hex });
     }
     std.mem.sort(Entry, list.items, {}, struct {
         fn less(_: void, a: Entry, b: Entry) bool {
@@ -53,7 +57,10 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     if (args.next()) |mode| {
         if (std.mem.eql(u8, mode, "--write")) {
-            const path = args.next() orelse "docs.sha256.current";
+            const path = args.next() orelse {
+                std.debug.print("docs-hash: --write 需要输出路径\n", .{});
+                std.process.exit(2);
+            };
             var out = std.ArrayListUnmanaged(u8).empty;
             defer out.deinit(gpa);
             try appendAll(&out, gpa, entries);
@@ -64,7 +71,10 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, mode, "--check")) {
-            const path = args.next() orelse "docs.sha256";
+            const path = args.next() orelse {
+                std.debug.print("docs-hash: --check 需要基线路径\n", .{});
+                std.process.exit(2);
+            };
             const base = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |e| {
                 std.debug.print("docs-hash: 无法读取基线 {s}: {t}\n", .{ path, e });
                 std.process.exit(2);
@@ -82,6 +92,8 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("docs-hash: docs/ 与基线不一致\n", .{});
             std.process.exit(1);
         }
+        std.debug.print("docs-hash: 未知参数 {s}\n", .{mode});
+        std.process.exit(2);
     }
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(gpa);

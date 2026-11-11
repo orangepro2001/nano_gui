@@ -109,6 +109,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_golden = b.addRunArtifact(golden);
+    run_golden.setCwd(b.path("."));
     run_golden.addArgs(&.{ "--check", "tests/golden/glfw/instrument_light/s100" });
     const golden_step = b.step("test-golden", "运行金图测试（无头）");
     golden_step.dependOn(&run_golden.step);
@@ -124,6 +125,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_replay = b.addRunArtifact(replay);
+    run_replay.setCwd(b.path("."));
     run_replay.addArg("tests/replay/basic.replay");
     const replay_step = b.step("test-replay", "运行输入回放测试");
     replay_step.dependOn(&run_replay.step);
@@ -166,6 +168,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_hash = b.addRunArtifact(hash_docs);
+    run_hash.setCwd(b.path("."));
     run_hash.addArgs(&.{ "--write", "docs.sha256.current" });
     const hash_step = b.step("docs-hash", "写出当前 docs/ 的 SHA-256 清单");
     hash_step.dependOn(&run_hash.step);
@@ -179,9 +182,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_check_hash = b.addRunArtifact(check_hash);
+    run_check_hash.setCwd(b.path("."));
     run_check_hash.addArgs(&.{ "--check", "docs.sha256" });
     const check_hash_step = b.step("check-docs-unchanged", "对比 docs/ 与基线哈希");
     check_hash_step.dependOn(&run_check_hash.step);
+
+    const baseline_hash = b.addExecutable(.{
+        .name = "baseline_docs_hash",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/hash_docs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_baseline = b.addRunArtifact(baseline_hash);
+    run_baseline.setCwd(b.path("."));
+    run_baseline.addArgs(&.{ "--write", "docs.sha256" });
+    const baseline_step = b.step("docs-hash-baseline", "刷新 docs.sha256 基线");
+    baseline_step.dependOn(&run_baseline.step);
 
     // ---- 格式化检查（可选，便于 CI）----
     const fmt_step = b.step("fmt-check", "检查 zig fmt");

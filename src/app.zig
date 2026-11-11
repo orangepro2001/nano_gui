@@ -56,10 +56,13 @@ pub const App = struct {
     commands: commands.Registry,
     settings: settings.Settings,
     post_head: ?*PostNode = null,
+    post_tail: ?*PostNode = null,
     post_spin: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    post_allocator: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator, opts: Options) !App {
         try platform.init(gpa);
+        gfx.init(gpa);
         try text.init(gpa, .{});
         core.stats.initRegistry();
         const w = try platform.createWindow(.{
@@ -85,6 +88,7 @@ pub const App = struct {
             .config = opts,
             .commands = commands.Registry.init(gpa),
             .settings = settings.Settings.init(gpa),
+            .post_allocator = std.heap.smp_allocator,
         };
     }
 
@@ -153,11 +157,11 @@ pub const App = struct {
 
     /// 线程安全：从工作线程回投闭包到界面线程。
     pub fn post(self: *App, closure: core.Closure) bool {
-        const node = std.heap.page_allocator.create(PostNode) catch return false;
+        const node = self.post_allocator.create(PostNode) catch return false;
         node.* = .{ .closure = closure };
         self.postLock();
-        node.next = self.post_head;
-        self.post_head = node;
+        if (self.post_tail) |tail| tail.next = node else self.post_head = node;
+        self.post_tail = node;
         self.postUnlock();
         platform.wake();
         return true;
@@ -173,11 +177,12 @@ pub const App = struct {
         self.postLock();
         var node = self.post_head;
         self.post_head = null;
+        self.post_tail = null;
         self.postUnlock();
         while (node) |n| {
             const next = n.next;
             n.closure.func(n.closure.ctx);
-            std.heap.page_allocator.destroy(n);
+            self.post_allocator.destroy(n);
             node = next;
         }
     }
