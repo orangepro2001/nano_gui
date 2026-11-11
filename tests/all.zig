@@ -399,7 +399,10 @@ test "DirectWrite glyph draw on Windows" {
     defer canvas.deinit();
     const owned = try text.layoutOwned(std.testing.allocator, "DirectWrite", .{ .size = 16 }, 1.0, .{});
     defer owned.layout.deinit();
-    text.draw(&canvas, owned.layout, .{ .x = 2, .y = 2 }, .{ .r = 0, .g = 0, .b = 0, .a = 255 }, .{});
+    nano.text.directwrite.draw(std.testing.allocator, &canvas, "DirectWrite", 16, 400, "Segoe UI", .{ .x = 2, .y = 2 }, .{ .r = 0, .g = 0, .b = 0, .a = 255 }) catch |e| {
+        std.debug.print("directwrite.draw error: {t}\n", .{e});
+        return e;
+    };
     var nonzero: usize = 0;
     for (pixels) |v| if (v != 0) {
         nonzero += 1;
