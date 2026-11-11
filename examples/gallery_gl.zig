@@ -5,6 +5,85 @@
 const std = @import("std");
 const nano = @import("nano_gui");
 const c = @import("gl_headers");
+const core = nano.core;
+
+fn nvgOf(ctx: *anyopaque) *c.NVGcontext {
+    return @ptrCast(@alignCast(ctx));
+}
+fn col(cv: core.Color) c.NVGcolor {
+    return c.nvgRGBA(cv.r, cv.g, cv.b, cv.a);
+}
+fn hFill(ctx: *anyopaque, r: core.Rect, color: core.Color) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgRect(n, r.x, r.y, r.w, r.h);
+    c.nvgFillColor(n, col(color));
+    c.nvgFill(n);
+}
+fn hFillV(ctx: *anyopaque, r: core.Rect, top: core.Color, bottom: core.Color) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgRect(n, r.x, r.y, r.w, r.h);
+    const paint = c.nvgLinearGradient(n, r.x, r.y, r.x, r.y + r.h, col(top), col(bottom));
+    c.nvgFillPaint(n, paint);
+    c.nvgFill(n);
+}
+fn hFillRound(ctx: *anyopaque, r: core.Rect, radius: f32, color: core.Color) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgRoundedRect(n, r.x, r.y, r.w, r.h, radius);
+    c.nvgFillColor(n, col(color));
+    c.nvgFill(n);
+}
+fn hFillRoundV(ctx: *anyopaque, r: core.Rect, radius: f32, top: core.Color, bottom: core.Color) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgRoundedRect(n, r.x, r.y, r.w, r.h, radius);
+    const paint = c.nvgLinearGradient(n, r.x, r.y, r.x, r.y + r.h, col(top), col(bottom));
+    c.nvgFillPaint(n, paint);
+    c.nvgFill(n);
+}
+fn hStrokeRect(ctx: *anyopaque, r: core.Rect, color: core.Color, width: i32) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgRect(n, r.x, r.y, r.w, r.h);
+    c.nvgStrokeColor(n, col(color));
+    c.nvgStrokeWidth(n, @floatFromInt(@max(1, width)));
+    c.nvgStroke(n);
+}
+fn hStrokeRound(ctx: *anyopaque, r: core.Rect, radius: f32, color: core.Color, width: i32) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgRoundedRect(n, r.x, r.y, r.w, r.h, radius);
+    c.nvgStrokeColor(n, col(color));
+    c.nvgStrokeWidth(n, @floatFromInt(@max(1, width)));
+    c.nvgStroke(n);
+}
+fn hStrokeLine(ctx: *anyopaque, a: core.Vec2, b: core.Vec2, color: core.Color, width: i32) void {
+    const n = nvgOf(ctx);
+    c.nvgBeginPath(n);
+    c.nvgMoveTo(n, a.x, a.y);
+    c.nvgLineTo(n, b.x, b.y);
+    c.nvgStrokeColor(n, col(color));
+    c.nvgStrokeWidth(n, @floatFromInt(@max(1, width)));
+    c.nvgStroke(n);
+}
+fn hPushClip(ctx: *anyopaque, r: core.Rect) void {
+    const n = nvgOf(ctx);
+    c.nvgSave(n);
+    c.nvgScissor(n, r.x, r.y, r.w, r.h);
+}
+fn hPopClip(ctx: *anyopaque) void {
+    c.nvgRestore(nvgOf(ctx));
+}
+fn hPushTranslate(ctx: *anyopaque, dx: f32, dy: f32) void {
+    const n = nvgOf(ctx);
+    c.nvgSave(n);
+    c.nvgTranslate(n, dx, dy);
+}
+fn hPopTransform(ctx: *anyopaque) void {
+    c.nvgRestore(nvgOf(ctx));
+}
 
 const W: c_int = 360;
 const H: c_int = 220;
@@ -48,28 +127,30 @@ pub fn main(init: std.process.Init) !void {
         c.glClear(c.GL_COLOR_BUFFER_BIT | c.GL_STENCIL_BUFFER_BIT | c.GL_DEPTH_BUFFER_BIT);
 
         c.nvgBeginFrame(nvg, @floatFromInt(W), @floatFromInt(H), 1.0);
-        c.nvgBeginPath(nvg);
-        c.nvgRoundedRect(nvg, 20, 20, 200, 80, 6);
-        c.nvgFillColor(nvg, c.nvgRGBA(47, 110, 223, 255));
-        c.nvgFill(nvg);
-        c.nvgBeginPath(nvg);
-        c.nvgCircle(nvg, 300, 60, 30);
-        c.nvgFillColor(nvg, c.nvgRGBA(31, 89, 198, 255));
-        c.nvgFill(nvg);
-        c.nvgBeginPath(nvg);
-        c.nvgRoundedRect(nvg, 20, 120, 320, 70, 5);
-        c.nvgFillColor(nvg, c.nvgRGBA(249, 250, 251, 255));
-        c.nvgFill(nvg);
-        c.nvgStrokeColor(nvg, c.nvgRGBA(154, 161, 171, 255));
-        c.nvgStrokeWidth(nvg, 1.0);
-        c.nvgStroke(nvg);
-
-        c.nvgFontFace(nvg, "sans");
-        c.nvgFontSize(nvg, 18);
-        c.nvgTextAlign(nvg, c.NVG_ALIGN_LEFT | c.NVG_ALIGN_MIDDLE);
-        c.nvgFillColor(nvg, c.nvgRGBA(27, 31, 36, 255));
-        const msg = "NanoVG GL3 / OpenGL 3.3";
-        _ = c.nvgText(nvg, 34, 155, msg.ptr, null);
+        var canvas = nano.gfx.Canvas.init(gpa, &.{}, @intCast(W), @intCast(H), 1.0);
+        canvas.gl = .{
+            .ctx = @ptrCast(nvg),
+            .fill_rect = hFill,
+            .fill_rect_v = hFillV,
+            .fill_round_rect = hFillRound,
+            .fill_round_rect_v = hFillRoundV,
+            .stroke_rect = hStrokeRect,
+            .stroke_round_rect = hStrokeRound,
+            .stroke_line = hStrokeLine,
+            .push_clip = hPushClip,
+            .pop_clip = hPopClip,
+            .push_translate = hPushTranslate,
+            .pop_transform = hPopTransform,
+        };
+        var th = nano.theme.Theme.default(.light, .{});
+        var dctx = nano.theme.DrawCtx{ .canvas = &canvas, .theme = &th, .scale = 1.0 };
+        nano.theme.drawRaised(&dctx, .{ .x = 20, .y = 20, .w = 200, .h = 80 }, .radius_control, .accent, .{ .hovered = false, .pressed = false, .focused_visible = false, .hover_t = 0, .press_t = 0, .focus_t = 0 });
+        nano.theme.drawPanel(&dctx, .{ .x = 20, .y = 120, .w = 320, .h = 70 }, .radius_container);
+        nano.theme.drawMark(&dctx, .check, .{ .x = 260, .y = 44, .w = 28, .h = 28 }, .text_primary);
+        const style = th.fonts.get(.body);
+        const owned = try nano.text.layoutOwned(gpa, "NanoVG Canvas / text.draw", style, 1.0, .{});
+        defer owned.layout.deinit();
+        nano.text.draw(&canvas, owned.layout, .{ .x = 34, .y = 176 }, th.color(.text_primary), .{});
         c.nvgEndFrame(nvg);
         c.glfwSwapBuffers(win);
     }

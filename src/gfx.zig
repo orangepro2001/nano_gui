@@ -292,7 +292,24 @@ pub const PathBuilder = struct {
 // Canvas
 // ---------------------------------------------------------------------------
 
+/// NanoVG/GL 后端的绘制钩子。Canvas 不直接依赖 C 模块；GL 示例注入实现。
+pub const GlHooks = struct {
+    ctx: *anyopaque,
+    fill_rect: *const fn (ctx: *anyopaque, r: core.Rect, color: core.Color) void,
+    fill_rect_v: *const fn (ctx: *anyopaque, r: core.Rect, top: core.Color, bottom: core.Color) void,
+    fill_round_rect: *const fn (ctx: *anyopaque, r: core.Rect, radius: f32, color: core.Color) void,
+    fill_round_rect_v: *const fn (ctx: *anyopaque, r: core.Rect, radius: f32, top: core.Color, bottom: core.Color) void,
+    stroke_rect: *const fn (ctx: *anyopaque, r: core.Rect, color: core.Color, width: i32) void,
+    stroke_round_rect: *const fn (ctx: *anyopaque, r: core.Rect, radius: f32, color: core.Color, width: i32) void,
+    stroke_line: *const fn (ctx: *anyopaque, a: core.Vec2, b: core.Vec2, color: core.Color, width: i32) void,
+    push_clip: *const fn (ctx: *anyopaque, r: core.Rect) void,
+    pop_clip: *const fn (ctx: *anyopaque) void,
+    push_translate: *const fn (ctx: *anyopaque, dx: f32, dy: f32) void,
+    pop_transform: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Canvas = struct {
+    gl: ?GlHooks = null,
     pixels: []u8,
     width: u32,
     height: u32,
@@ -352,6 +369,7 @@ pub const Canvas = struct {
     }
 
     pub fn fillRect(self: *Canvas, r: core.Rect, color: core.Color) void {
+        if (self.gl) |g| return g.fill_rect(g.ctx, r, color);
         const ri = self.toRectI(r);
         if (ri.isEmpty()) return;
         const clipped = ri.intersect(self.clip);
@@ -364,6 +382,7 @@ pub const Canvas = struct {
     }
 
     pub fn fillRectV(self: *Canvas, r: core.Rect, top: core.Color, bottom: core.Color) void {
+        if (self.gl) |g| return g.fill_rect_v(g.ctx, r, top, bottom);
         const ri = self.toRectI(r);
         if (ri.isEmpty()) return;
         const clipped = ri.intersect(self.clip);
@@ -386,6 +405,7 @@ pub const Canvas = struct {
     }
 
     pub fn fillRoundRect(self: *Canvas, r: core.Rect, radius: f32, color: core.Color) void {
+        if (self.gl) |g| return g.fill_round_rect(g.ctx, r, radius, color);
         const ri = self.toRectI(r);
         if (ri.isEmpty()) return;
         const clipped = ri.intersect(self.clip);
@@ -407,6 +427,7 @@ pub const Canvas = struct {
     }
 
     pub fn fillRoundRectV(self: *Canvas, r: core.Rect, radius: f32, top: core.Color, bottom: core.Color) void {
+        if (self.gl) |g| return g.fill_round_rect_v(g.ctx, r, radius, top, bottom);
         const ri = self.toRectI(r);
         if (ri.isEmpty()) return;
         const clipped = ri.intersect(self.clip);
@@ -430,6 +451,7 @@ pub const Canvas = struct {
     }
 
     pub fn strokeRect(self: *Canvas, r: core.Rect, color: core.Color, width_ppx: i32) void {
+        if (self.gl) |g| return g.stroke_rect(g.ctx, r, color, width_ppx);
         const w: f32 = @floatFromInt(@max(1, width_ppx));
         const s = r;
         self.fillRect(.{ .x = s.x, .y = s.y, .w = s.w, .h = w / self.scale }, color);
@@ -439,6 +461,7 @@ pub const Canvas = struct {
     }
 
     pub fn strokeRoundRect(self: *Canvas, r: core.Rect, radius: f32, color: core.Color, width_ppx: i32) void {
+        if (self.gl) |g| return g.stroke_round_rect(g.ctx, r, radius, color, width_ppx);
         const ri = self.toRectI(r);
         if (ri.isEmpty()) return;
         const clipped = ri.intersect(self.clip);
@@ -461,6 +484,7 @@ pub const Canvas = struct {
     }
 
     pub fn strokeLine(self: *Canvas, a: core.Vec2, b: core.Vec2, color: core.Color, width_ppx: i32) void {
+        if (self.gl) |g| return g.stroke_line(g.ctx, a, b, color, width_ppx);
         const ax = self.px(a.x);
         const ay = self.py(a.y);
         const bx = self.px(b.x);
@@ -540,6 +564,12 @@ pub const Canvas = struct {
     }
 
     pub fn strokePath(self: *Canvas, p: *const PathBuilder, color: core.Color, width_lpx: f32, cap: LineCap, join: LineJoin) void {
+        if (self.gl != null) {
+            const w: i32 = @intFromFloat(@round(@max(1.0, width_lpx * self.scale)));
+            var i: usize = 0;
+            while (i + 1 < p.count) : (i += 1) self.strokeLine(p.points[i], p.points[i + 1], color, w);
+            return;
+        }
         _ = cap;
         _ = join;
         const w: i32 = @intFromFloat(@round(@max(1.0, width_lpx * self.scale)));
@@ -548,17 +578,20 @@ pub const Canvas = struct {
     }
 
     pub fn pushClip(self: *Canvas, r: core.Rect) void {
+        if (self.gl) |g| return g.push_clip(g.ctx, r);
         if (self.clip_depth >= self.clip_stack.len) return;
         self.clip_stack[self.clip_depth] = self.clip;
         self.clip_depth += 1;
         self.clip = self.clip.intersect(self.toRectI(r));
     }
     pub fn popClip(self: *Canvas) void {
+        if (self.gl) |g| return g.pop_clip(g.ctx);
         if (self.clip_depth == 0) return;
         self.clip_depth -= 1;
         self.clip = self.clip_stack[self.clip_depth];
     }
     pub fn pushTranslate(self: *Canvas, dx: f32, dy: f32) void {
+        if (self.gl) |g| return g.push_translate(g.ctx, dx, dy);
         if (self.transform_depth < self.transform_stack.len) {
             self.transform_stack[self.transform_depth] = .{ .x = self.translate_x, .y = self.translate_y };
             self.transform_depth += 1;
@@ -572,6 +605,7 @@ pub const Canvas = struct {
         _ = radians;
     }
     pub fn popTransform(self: *Canvas) void {
+        if (self.gl) |g| return g.pop_transform(g.ctx);
         if (self.transform_depth == 0) return;
         self.transform_depth -= 1;
         self.translate_x = self.transform_stack[self.transform_depth].x;
