@@ -12,3 +12,7 @@ Thumbs.db
 /test-out/
 *.actual.png
 *.diff.png
+
+# 文档哈希临时文件
+docs.sha256.current
+docs.sha256.before

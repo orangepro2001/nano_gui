@@ -1,0 +1,7 @@
+# 点击目标按钮，断言结果与计数标签
+move @target
+down left
+up left
+advance 16
+expect result @target clicked true
+expect text @counter "1"

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux build, tests, golden, replay and docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl xz-utils ca-certificates \
+            libx11-dev xvfb xdotool
+
+      - name: Install Zig 0.17.1
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  /tmp/zig.tar.xz" | sha256sum -c -
+          sudo tar -C /opt -xf /tmp/zig.tar.xz
+          sudo ln -sf /opt/zig-x86_64-linux-0.17.1/zig /usr/local/bin/zig
+          zig version
+
+      - name: Format check
+        run: zig fmt --check src examples tests tools build.zig
+
+      - name: Build all examples
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Golden tests
+        run: zig build test-golden
+
+      - name: Replay tests
+        run: zig build test-replay
+
+      - name: Documentation checks
+        run: |
+          zig build check-docs
+          zig build check-docs-unchanged
+
+      - name: Benchmark smoke
+        run: zig build bench
+
+      - name: X11 native window smoke test
+        run: |
+          mkdir -p test-out
+          xvfb-run -a ./zig-out/bin/gallery_window --frames 3 --png test-out/gallery-window.png
+          file test-out/gallery-window.png
+
+      - name: Cross compile Windows x86_64
+        run: zig build -Dtarget=x86_64-windows-gnu
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nano-gui-linux-artifacts
+          path: |
+            test-out/
+            artifacts/
+          if-no-files-found: error
