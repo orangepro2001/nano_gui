@@ -254,23 +254,25 @@ test "integration: frame ids, click, transient state" {
     const st2 = u.state(u32, id, 1);
     try std.testing.expectEqual(@as(u32, 1), st2.*);
 
-    // AC-PLAT-012：超时推进假时钟、无限等待返回 idle、wake 合并。
-    const t_before = platform.nowMs();
-    try std.testing.expectEqual(platform.WaitResult.timeout, platform.waitMessages(100));
-    try std.testing.expectEqual(t_before + 100, platform.nowMs());
-    try std.testing.expectEqual(platform.WaitResult.idle, platform.waitMessages(null));
-    const W = struct {
-        fn run() void {
-            platform.wake();
-        }
-    };
-    const wake_thread = try std.Thread.spawn(.{}, W.run, .{});
-    wake_thread.join();
-    try std.testing.expectEqual(platform.WaitResult.woken, platform.waitMessages(null));
-    var k: usize = 0;
-    while (k < 1000) : (k += 1) platform.wake();
-    try std.testing.expectEqual(platform.WaitResult.woken, platform.waitMessages(null));
-    try std.testing.expectEqual(platform.WaitResult.idle, platform.waitMessages(null));
+    // AC-PLAT-012：无头模式的超时/空闲/wake 合并语义。
+    if (std.mem.eql(u8, platform.backend_name, "headless")) {
+        const t_before = platform.nowMs();
+        try std.testing.expectEqual(platform.WaitResult.timeout, platform.waitMessages(100));
+        try std.testing.expectEqual(t_before + 100, platform.nowMs());
+        try std.testing.expectEqual(platform.WaitResult.idle, platform.waitMessages(null));
+        const W = struct {
+            fn run() void {
+                platform.wake();
+            }
+        };
+        const wake_thread = try std.Thread.spawn(.{}, W.run, .{});
+        wake_thread.join();
+        try std.testing.expectEqual(platform.WaitResult.woken, platform.waitMessages(null));
+        var k: usize = 0;
+        while (k < 1000) : (k += 1) platform.wake();
+        try std.testing.expectEqual(platform.WaitResult.woken, platform.waitMessages(null));
+        try std.testing.expectEqual(platform.WaitResult.idle, platform.waitMessages(null));
+    }
 
     // AC-ARCH-005：App.post 必须按入队顺序执行。
     var posted = nano.app.App.init(std.testing.allocator, .{ .size = .{ .w = 200, .h = 120 } }) catch return error.TestUnexpectedResult;
