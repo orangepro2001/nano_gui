@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const winapi = std.os.windows;
+const core = @import("../core.zig");
+const gfx = @import("../gfx.zig");
 
 pub const FACTORY_TYPE_SHARED: u32 = 0;
 pub const IID_IDWriteFactory = winapi.GUID{
@@ -42,7 +44,9 @@ const IDWriteTextLayout = extern struct {
         Release: *const fn (*anyopaque) callconv(.winapi) u32,
         /// IDWriteTextFormat 的 25 个方法 + layout 的 Set*/Get*/Draw/GetLineMetrics 等，
         /// 直到 GetMetrics 之前的全部槽位（顺序以 dwrite.h 为准）。
-        before_metrics: [57]*const fn () callconv(.winapi) void,
+        before_draw: [55]*const fn () callconv(.winapi) void,
+        Draw: *const fn (*anyopaque, *anyopaque, f32, f32) callconv(.winapi) i32,
+        GetLineMetrics: *const fn () callconv(.winapi) void,
         GetMetrics: *const fn (*anyopaque, *TextMetrics) callconv(.winapi) i32,
         after_metrics: [6]*const fn () callconv(.winapi) void,
     };
@@ -58,6 +62,75 @@ const IDWriteTextFormat = extern struct {
     };
 };
 
+const GlyphRun = extern struct {
+    fontFace: *anyopaque,
+    fontSize: f32,
+    glyphCount: u32,
+    glyphIndices: [*]const u16,
+    glyphAdvances: [*]const f32,
+    glyphOffsets: *const anyopaque,
+    isSideways: i32,
+    bidiLevel: u32,
+};
+const GlyphRunDescription = extern struct {
+    localeName: [*:0]const u16,
+    string: [*]const u16,
+    stringLength: u32,
+    clusterMap: [*]const u16,
+    textPosition: u32,
+    textLength: u32,
+};
+const Rect = extern struct { left: i32 = 0, top: i32 = 0, right: i32 = 0, bottom: i32 = 0 };
+
+const IDWriteGdiInterop = extern struct {
+    vtbl: *const Vtbl,
+    const Vtbl = extern struct {
+        QueryInterface: *const fn () callconv(.winapi) void,
+        AddRef: *const fn () callconv(.winapi) void,
+        Release: *const fn (*anyopaque) callconv(.winapi) u32,
+        CreateFontFromLOGFONT: *const fn () callconv(.winapi) void,
+        ConvertFontToLOGFONT: *const fn () callconv(.winapi) void,
+        ConvertFontFaceToLOGFONT: *const fn () callconv(.winapi) void,
+        CreateFontFaceFromHdc: *const fn () callconv(.winapi) void,
+        CreateBitmapRenderTarget: *const fn (*anyopaque, ?*anyopaque, u32, u32, *?*IDWriteBitmapRenderTarget) callconv(.winapi) i32,
+    };
+};
+
+const IDWriteBitmapRenderTarget = extern struct {
+    vtbl: *const Vtbl,
+    const Vtbl = extern struct {
+        QueryInterface: *const fn () callconv(.winapi) void,
+        AddRef: *const fn () callconv(.winapi) void,
+        Release: *const fn (*anyopaque) callconv(.winapi) u32,
+        DrawGlyphRun: *const fn (*anyopaque, f32, f32, u32, *const GlyphRun, ?*anyopaque, u32, ?*Rect) callconv(.winapi) i32,
+        GetMemoryDC: *const fn (*anyopaque) callconv(.winapi) ?*anyopaque,
+        GetPixelsPerDip: *const fn (*anyopaque) callconv(.winapi) f32,
+        SetPixelsPerDip: *const fn () callconv(.winapi) void,
+        GetCurrentTransform: *const fn () callconv(.winapi) void,
+        SetCurrentTransform: *const fn () callconv(.winapi) void,
+        GetSize: *const fn (*anyopaque, *Rect) callconv(.winapi) i32,
+        Resize: *const fn () callconv(.winapi) void,
+    };
+};
+
+const TextRenderer = extern struct {
+    vtbl: *const Vtbl,
+    target: *IDWriteBitmapRenderTarget,
+    color: u32 = 0xFFFFFF,
+    const Vtbl = extern struct {
+        QueryInterface: *const fn (*anyopaque, *const winapi.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
+        Release: *const fn (*anyopaque) callconv(.winapi) u32,
+        IsPixelSnappingDisabled: *const fn (*anyopaque, ?*anyopaque, *i32) callconv(.winapi) i32,
+        GetCurrentTransform: *const fn (*anyopaque, ?*anyopaque, *anyopaque) callconv(.winapi) i32,
+        GetPixelsPerDip: *const fn (*anyopaque, ?*anyopaque, *f32) callconv(.winapi) i32,
+        DrawGlyphRun: *const fn (*anyopaque, ?*anyopaque, f32, f32, u32, *const GlyphRun, *const GlyphRunDescription, ?*anyopaque) callconv(.winapi) i32,
+        DrawUnderline: *const fn () callconv(.winapi) void,
+        DrawStrikethrough: *const fn () callconv(.winapi) void,
+        DrawInlineObject: *const fn () callconv(.winapi) void,
+    };
+};
+
 const IDWriteFactory = extern struct {
     vtbl: *const Vtbl,
     const Vtbl = extern struct {
@@ -68,7 +141,7 @@ const IDWriteFactory = extern struct {
         pre_text_format: [11]*const fn () callconv(.winapi) void,
         CreateTextFormat: *const fn (*anyopaque, [*:0]const u16, ?*anyopaque, u32, u32, u32, f32, [*:0]const u16, *?*IDWriteTextFormat) callconv(.winapi) i32,
         CreateTypography: *const fn () callconv(.winapi) void,
-        GetGdiInterop: *const fn () callconv(.winapi) void,
+        GetGdiInterop: *const fn (*anyopaque, *?*IDWriteGdiInterop) callconv(.winapi) i32,
         CreateTextLayout: *const fn (*anyopaque, [*]const u16, u32, *IDWriteTextFormat, f32, f32, *?*IDWriteTextLayout) callconv(.winapi) i32,
     };
 };
@@ -119,4 +192,117 @@ pub fn measure(allocator: std.mem.Allocator, text: []const u8, size_lpx: f32, we
 /// 仅验工厂可用；用于 Windows 启动自检。
 pub fn selfTest() bool {
     return ensureFactory();
+}
+
+fn cbQuery(_: *anyopaque, _: *const winapi.GUID, _: *?*anyopaque) callconv(.winapi) i32 {
+    return @bitCast(@as(u32, 0x80004002));
+}
+fn cbAddRef(_: *anyopaque) callconv(.winapi) u32 {
+    return 1;
+}
+fn cbRelease(_: *anyopaque) callconv(.winapi) u32 {
+    return 1;
+}
+fn cbSnap(_: *anyopaque, _: ?*anyopaque, disabled: *i32) callconv(.winapi) i32 {
+    disabled.* = 1;
+    return 0;
+}
+fn cbTransform(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) callconv(.winapi) i32 {
+    return 0;
+}
+fn cbPixels(_: *anyopaque, _: ?*anyopaque, ppd: *f32) callconv(.winapi) i32 {
+    ppd.* = 1.0;
+    return 0;
+}
+fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: *const GlyphRun, _: *const GlyphRunDescription, _: ?*anyopaque) callconv(.winapi) i32 {
+    const r: *TextRenderer = @ptrCast(@alignCast(this));
+    return r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, null, r.color, null);
+}
+fn cbUnderline() callconv(.winapi) void {}
+fn cbStrike() callconv(.winapi) void {}
+fn cbInline() callconv(.winapi) void {}
+
+const renderer_vtbl = TextRenderer.Vtbl{
+    .QueryInterface = cbQuery,
+    .AddRef = cbAddRef,
+    .Release = cbRelease,
+    .IsPixelSnappingDisabled = cbSnap,
+    .GetCurrentTransform = cbTransform,
+    .GetPixelsPerDip = cbPixels,
+    .DrawGlyphRun = cbGlyphRun,
+    .DrawUnderline = cbUnderline,
+    .DrawStrikethrough = cbStrike,
+    .DrawInlineObject = cbInline,
+};
+
+extern "gdi32" fn CreateCompatibleDC(hdc: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteDC(hdc: ?*anyopaque) callconv(.winapi) i32;
+extern "gdi32" fn GetCurrentObject(hdc: ?*anyopaque, ty: u32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn GetDIBits(hdc: ?*anyopaque, bmp: ?*anyopaque, start: u32, lines: u32, bits: ?*anyopaque, bmi: *const BitmapInfo, usage: u32) callconv(.winapi) i32;
+
+const BitmapInfoHeader = extern struct {
+    biSize: u32 = @sizeOf(BitmapInfoHeader),
+    biWidth: i32 = 0,
+    biHeight: i32 = 0,
+    biPlanes: u16 = 1,
+    biBitCount: u16 = 32,
+    biCompression: u32 = 0,
+    biSizeImage: u32 = 0,
+    biXPelsPerMeter: i32 = 0,
+    biYPelsPerMeter: i32 = 0,
+    biClrUsed: u32 = 0,
+    biClrImportant: u32 = 0,
+};
+const BitmapInfo = extern struct { bmiHeader: BitmapInfoHeader = .{}, bmiColors: [1]u32 = .{0} };
+
+/// 用 DirectWrite/GDI 兼容位图渲染文字，并混合到 Canvas。
+pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8, size_lpx: f32, weight: u16, family: []const u8, origin: core.Vec2, color: core.Color) !void {
+    if (!ensureFactory()) return error.DirectWriteUnavailable;
+    const f = factory orelse return error.DirectWriteUnavailable;
+    const wide = try std.unicode.utf8ToUtf16LeAlloc(allocator, text);
+    defer allocator.free(wide);
+    const family_z = try std.unicode.utf8ToUtf16LeAllocZ(allocator, family);
+    defer allocator.free(family_z);
+    var fmt: ?*IDWriteTextFormat = null;
+    const locale = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
+    if (f.vtbl.CreateTextFormat(f, family_z.ptr, null, weight, 0, 5, size_lpx, locale, &fmt) < 0 or fmt == null) return error.DirectWriteFailed;
+    defer _ = fmt.?.vtbl.Release(fmt.?);
+    var layout: ?*IDWriteTextLayout = null;
+    if (f.vtbl.CreateTextLayout(f, wide.ptr, @intCast(wide.len), fmt.?, 1.0e7, 1.0e7, &layout) < 0 or layout == null) return error.DirectWriteFailed;
+    defer _ = layout.?.vtbl.Release(layout.?);
+    var metrics: TextMetrics = .{};
+    if (layout.?.vtbl.GetMetrics(layout.?, &metrics) < 0) return error.DirectWriteFailed;
+    const w: u32 = @intFromFloat(@max(1, @ceil(metrics.width) + 4));
+    const h: u32 = @intFromFloat(@max(1, @ceil(metrics.height) + 4));
+    var gdi: ?*IDWriteGdiInterop = null;
+    if (f.vtbl.GetGdiInterop(f, &gdi) < 0 or gdi == null) return error.DirectWriteFailed;
+    defer _ = gdi.?.vtbl.Release(gdi.?);
+    const dc = CreateCompatibleDC(null) orelse return error.DirectWriteFailed;
+    defer _ = DeleteDC(dc);
+    var target: ?*IDWriteBitmapRenderTarget = null;
+    if (gdi.?.vtbl.CreateBitmapRenderTarget(gdi.?, dc, w, h, &target) < 0 or target == null) return error.DirectWriteFailed;
+    defer _ = target.?.vtbl.Release(target.?);
+    const text_color: u32 = @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16);
+    var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color };
+    if (layout.?.vtbl.Draw(layout.?, @ptrCast(&renderer), 2.0, 2.0) < 0) return error.DirectWriteFailed;
+    const memdc = target.?.vtbl.GetMemoryDC(target.?) orelse return error.DirectWriteFailed;
+    const bmp = GetCurrentObject(memdc, 7) orelse return error.DirectWriteFailed; // OBJ_BITMAP
+    const bits = try allocator.alloc(u8, @as(usize, w) * h * 4);
+    defer allocator.free(bits);
+    var bmi = BitmapInfo{};
+    bmi.bmiHeader.biWidth = @intCast(w);
+    bmi.bmiHeader.biHeight = -@as(i32, @intCast(h));
+    if (GetDIBits(memdc, bmp, 0, h, bits.ptr, &bmi, 0) == 0) return error.DirectWriteFailed;
+    // target 为 BGRA；按 alpha 混合到 Canvas 的 RGBA。
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const o = (@as(usize, y) * w + x) * 4;
+            const a = bits[o + 3];
+            if (a == 0) continue;
+            const px = core.Color{ .r = bits[o + 2], .g = bits[o + 1], .b = bits[o], .a = a };
+            canvas.blitPixel(origin.x + @as(f32, @floatFromInt(x)), origin.y + @as(f32, @floatFromInt(y)), px);
+        }
+    }
 }

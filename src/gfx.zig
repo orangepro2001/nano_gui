@@ -655,6 +655,14 @@ pub const Canvas = struct {
         }
     }
 
+    /// 按一个像素混合颜色；供 DirectWrite 字形位图等外部栅格使用。
+    pub fn blitPixel(self: *Canvas, x: f32, y: f32, color: core.Color) void {
+        if (self.gl) |g| return g.fill_rect(g.ctx, .{ .x = x, .y = y, .w = 1, .h = 1 }, color);
+        const ix: i32 = @intFromFloat(@round(x));
+        const iy: i32 = @intFromFloat(@round(y));
+        self.putPixel(ix, iy, color, 1.0);
+    }
+
     /// 内部：直接绘制一个 1bpp 字形位图（供确定性的 fixed 文字后端使用）。
     pub fn blitAlpha(self: *Canvas, x: i32, y: i32, w: i32, h: i32, bits: []const u8, color: core.Color) void {
         var yy: i32 = 0;
