@@ -11,5 +11,6 @@
         "examples",
         "tests",
         "tools",
+        "third_party",
     },
 }

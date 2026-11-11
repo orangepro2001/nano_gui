@@ -70,6 +70,42 @@ pub fn build(b: *std.Build) void {
         run_win_step.dependOn(&run_win.step);
     }
 
+    if (target.result.os.tag == .linux) {
+        const gl_tc = b.addTranslateC(.{
+            .root_source_file = b.path("examples/gl_headers.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gl_tc.addIncludePath(b.path("third_party/nanovg"));
+        const gl_headers = gl_tc.createModule();
+        const gl_mod = b.createModule(.{
+            .root_source_file = b.path("examples/gallery_gl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "nano_gui", .module = mod },
+                .{ .name = "gl_headers", .module = gl_headers },
+            },
+        });
+        gl_mod.addIncludePath(b.path("third_party/nanovg"));
+        gl_mod.addCSourceFiles(.{
+            .root = b.path("third_party/nanovg"),
+            .files = &.{ "nanovg.c", "nanovg_gl3.c" },
+            .flags = &.{"-std=c99"},
+        });
+        gl_mod.linkSystemLibrary("GLEW", .{});
+        gl_mod.linkSystemLibrary("glfw", .{});
+        gl_mod.linkSystemLibrary("GL", .{});
+        const gl_exe = b.addExecutable(.{ .name = "gallery_gl", .root_module = gl_mod });
+        b.installArtifact(gl_exe);
+        const run_gl = b.addRunArtifact(gl_exe);
+        run_gl.setCwd(b.path("."));
+        run_gl.addPassthruArgs();
+        const gl_step = b.step("run-gallery-gl", "运行 NanoVG GL3 示例");
+        gl_step.dependOn(&run_gl.step);
+    }
+
     if (target.result.os.tag == .windows) {
         const win_mod = b.createModule(.{
             .root_source_file = b.path("examples/gallery_win32.zig"),
