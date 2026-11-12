@@ -162,7 +162,7 @@ const IDWriteFactory = extern struct {
         CreateEllipsisTrimmingSign: *const fn () callconv(.winapi) void,
         CreateTextAnalyzer: *const fn () callconv(.winapi) void,
         CreateNumberSubstitution: *const fn () callconv(.winapi) void,
-        CreateGlyphRunAnalysis: *const fn (*anyopaque, *const GlyphRun, f32, *const Matrix, u32, u32, f32, f32, *?*GlyphRunAnalysis) callconv(.winapi) i32,
+        CreateGlyphRunAnalysis: *const fn (*anyopaque, *const GlyphRun, f32, ?*const Matrix, u32, u32, f32, f32, *?*GlyphRunAnalysis) callconv(.winapi) i32,
     };
 };
 
