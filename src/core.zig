@@ -344,6 +344,9 @@ pub const stats = struct {
         kind: Kind,
         value: *u64,
         used: bool = false,
+        /// 是否有使用点调用过 counter/gauge/timerBegin；仅由 initRegistry 登记的项为 false，
+        /// 读数恒为 0 不代表真实测量（基准须判未测）。
+        instrumented: bool = false,
     };
 
     var slots: [max_entries]Slot = undefined;
@@ -376,39 +379,135 @@ pub const stats = struct {
         return ptr;
     }
 
+    fn markInstrumented(name: []const u8) void {
+        acquire();
+        defer release();
+        if (find(name)) |s| s.instrumented = true;
+    }
+
+    /// 该名字是否已被使用点写入过（见 Slot.instrumented）。
+    pub fn isInstrumented(name: []const u8) bool {
+        acquire();
+        defer release();
+        const s = find(name) orelse return false;
+        return s.instrumented;
+    }
+
+    /// 只读查询当前值；未登记返回 null。不会登记或置位。
+    pub fn read(name: []const u8) ?u64 {
+        acquire();
+        defer release();
+        const s = find(name) orelse return null;
+        return s.value.*;
+    }
+
     pub fn counter(comptime name: []const u8) *u64 {
+        const p = counterRaw(name);
+        markInstrumented(name);
+        return p;
+    }
+
+    pub fn gauge(comptime name: []const u8) *u64 {
+        const p = gaugeRaw(name);
+        markInstrumented(name);
+        return p;
+    }
+
+    fn counterRaw(comptime name: []const u8) *u64 {
+        // 结构体必须引用 name：不引用时各实例化共用同一类型，全部名字会别名到同一个存储。
         const S = struct {
+            const key = name;
             var v: u64 = 0;
         };
         return register(name, .counter, &S.v);
     }
 
-    pub fn gauge(comptime name: []const u8) *u64 {
+    fn gaugeRaw(comptime name: []const u8) *u64 {
+        // 结构体必须引用 name：不引用时各实例化共用同一类型，全部名字会别名到同一个存储。
         const S = struct {
+            const key = name;
             var v: u64 = 0;
         };
         return register(name, .gauge, &S.v);
     }
 
-    const TimerSlot = struct {
-        var total: u64 = 0;
-        var start: u64 = 0;
+    /// 单调时钟注入点（纳秒）。core 不直接调用操作系统 API（REQ-ARCH-002），
+    /// 由 platform 或基准驱动器注入；未注入时 timerEnd 不产生样本。
+    pub const ClockFn = *const fn () u64;
+    var clock_fn: ?ClockFn = null;
+
+    pub fn setClock(f: ?ClockFn) void {
+        clock_fn = f;
+    }
+
+    /// 每个计时器的样本缓冲上限（REQ-ARCH-014 精神）；满了丢最旧的。
+    pub const max_samples = 4096;
+    const max_timers = 16;
+
+    const Timer = struct {
+        name: []const u8 = "",
+        start: u64 = 0,
+        started: bool = false,
+        head: usize = 0,
+        len: usize = 0,
+        buf: [max_samples]u64 = undefined,
     };
 
+    var timers: [max_timers]Timer = undefined;
+    var timer_count: usize = 0;
+
+    /// 调用方须持有锁。
+    fn timerFind(name: []const u8, create: bool) ?*Timer {
+        var i: usize = 0;
+        while (i < timer_count) : (i += 1) {
+            if (std.mem.eql(u8, timers[i].name, name)) return &timers[i];
+        }
+        if (!create or timer_count >= max_timers) return null;
+        timers[timer_count] = .{ .name = name };
+        timer_count += 1;
+        return &timers[timer_count - 1];
+    }
+
     fn timerPtr(comptime name: []const u8) *u64 {
+        // 同 counter：引用 name 使每个名字有独立存储。
         const S = struct {
-            var total: u64 = 0;
+            const key = name;
+            var last: u64 = 0;
         };
-        return register(name, .timer, &S.total);
+        return register(name, .timer, &S.last);
     }
 
     pub fn timerBegin(comptime name: []const u8) void {
         _ = timerPtr(name);
+        markInstrumented(name);
+        const f = clock_fn orelse return;
+        const now = f();
+        acquire();
+        defer release();
+        const t = timerFind(name, true) orelse return;
+        t.start = now;
+        t.started = true;
     }
 
     pub fn timerEnd(comptime name: []const u8) void {
-        // 计时由注入的 Io/平台时钟在基准构建中采样；纯逻辑测试不依赖真实时钟。
-        _ = timerPtr(name);
+        const p = timerPtr(name);
+        const f = clock_fn orelse return;
+        const now = f();
+        acquire();
+        defer release();
+        const t = timerFind(name, true) orelse return;
+        if (!t.started) return;
+        t.started = false;
+        const ns = now -% t.start;
+        p.* = ns;
+        if (t.len == max_samples) {
+            // 满了丢最旧的。
+            t.buf[t.head] = ns;
+            t.head = (t.head + 1) % max_samples;
+        } else {
+            t.buf[(t.head + t.len) % max_samples] = ns;
+            t.len += 1;
+        }
     }
 
     /// 返回全部已注册项的快照；切片在下一次 snapshot 前有效。
@@ -422,8 +521,18 @@ pub const stats = struct {
         out.* = .{ .entries = snapshot_buf[0..count] };
     }
 
-    pub fn drainSamples(_: []const u8, _: []u64) usize {
-        return 0;
+    /// 按时间顺序取出并清空计时器 name 已积累的纳秒样本，返回个数；
+    /// out 放不下时只取最旧的 out.len 个，其余留在缓冲中。
+    pub fn drainSamples(name: []const u8, out: []u64) usize {
+        acquire();
+        defer release();
+        const t = timerFind(name, false) orelse return 0;
+        const n = @min(t.len, out.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) out[i] = t.buf[(t.head + i) % max_samples];
+        t.head = (t.head + n) % max_samples;
+        t.len -= n;
+        return n;
     }
 
     /// 注册 REQ-PERF-034 表中全部冻结名字；重复调用无副作用。
@@ -440,15 +549,15 @@ pub const stats = struct {
             "cache.text_layout.bytes", "cache.text_layout.entries", "cache.glyph_atlas.bytes",
             "cache.image.bytes",       "list.virtual_nodes",        "list.virtual_cells",
         };
-        const timers = [_][]const u8{
+        const timer_names = [_][]const u8{
             "time.collect", "time.dispatch",   "time.build",
             "time.layout",  "time.damage",     "time.paint",
             "time.present", "time.frame_cpu",  "time.input_to_present",
             "time.startup", "time.gl_context", "time.text_load",
         };
-        inline for (counters) |name| _ = counter(name);
-        inline for (gauges) |name| _ = gauge(name);
-        inline for (timers) |name| _ = timerPtr(name);
+        inline for (counters) |name| _ = counterRaw(name);
+        inline for (gauges) |name| _ = gaugeRaw(name);
+        inline for (timer_names) |name| _ = timerPtr(name);
     }
 
     pub fn resetAll() void {
@@ -456,6 +565,12 @@ pub const stats = struct {
         defer release();
         var i: usize = 0;
         while (i < count) : (i += 1) slots[i].value.* = 0;
+        i = 0;
+        while (i < timer_count) : (i += 1) {
+            timers[i].len = 0;
+            timers[i].head = 0;
+            timers[i].started = false;
+        }
     }
 };
 

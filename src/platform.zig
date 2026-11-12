@@ -576,6 +576,7 @@ const headless_state = struct {
     var appearance: SystemAppearance = .{};
     var present_count: u64 = 0;
     var advance_frames: u64 = 0;
+    var vsync_cycles: u64 = 0;
     var scale: f32 = 1.0;
 };
 
@@ -651,9 +652,24 @@ pub const Headless = struct {
     pub fn advanceMs(ms: u64) void {
         headless_state.now_ms += ms;
     }
+    /// 推进 n 个垂直同步周期；每周期 1000 / refresh_hz ms，按累计取整（REQ-PLAT-086、REQ-TEST-016）。
     pub fn vsync(n: u32) void {
-        headless_state.advance_frames += n;
-        headless_state.now_ms += @as(u64, n) * 16;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            headless_state.now_ms += peekVsyncPeriodMs();
+            completeVsyncCycle();
+        }
+    }
+    /// 下一个垂直同步周期的时长（ms）：第 k 周期为 floor((k+1)·1000/hz) − floor(k·1000/hz)，长期平均精确等于 1000/hz。
+    pub fn peekVsyncPeriodMs() u64 {
+        const hz: u64 = if (monitors_buf[0].refresh_hz > 0) monitors_buf[0].refresh_hz else 60;
+        const k = headless_state.vsync_cycles;
+        return (k + 1) * 1000 / hz - k * 1000 / hz;
+    }
+    /// 记一次垂直同步周期结束（不推进时钟）；供已自行推进时钟的回放运行器使用。
+    pub fn completeVsyncCycle() void {
+        headless_state.vsync_cycles += 1;
+        headless_state.advance_frames += 1;
     }
     pub fn presentCount() u64 {
         return headless_state.present_count;
@@ -852,7 +868,7 @@ pub fn appearance(_: ?*Window) SystemAppearance {
 }
 
 pub fn monitors() []const Monitor {
-    return headless_state.monitors[0..];
+    return monitors_buf[0..];
 }
 
 pub const Monitor = struct {

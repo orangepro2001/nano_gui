@@ -1,7 +1,19 @@
-# 点击目标按钮，断言结果与计数标签
+# 基本回放：点击目标按钮，断言焦点、结果、计数标签与计数器
+# 初始状态：计数标签为 0
+expect text @counter "0"
 move @target
 down left
+# 计数器基线放在释放之前：只度量点击这一帧
+mark
 up left
+# 点击帧：第一遍收到 clicked，随即执行第二遍（REQ-FRAME-030），共 2 遍、1 帧、1 次提交
+# （实测值，对应 AC-FRAME-018）
+expect counter frame.build_passes == 2
+expect counter frame.count == 1
+expect counter frame.presents == 1
 advance 16
-expect result @target clicked true
+# 第二遍事件已消费（REQ-FRAME-033）
+expect result @target clicked true pass 1
+expect result @target clicked false pass 2
+expect focus @target
 expect text @counter "1"

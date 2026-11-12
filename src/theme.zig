@@ -79,6 +79,7 @@ pub const Metric = enum {
     pad_item_x,
     icon_sm,
     icon_md,
+    icon_lg,
     check_size,
     switch_w,
     switch_h,
@@ -95,11 +96,16 @@ pub const Metric = enum {
     indent,
     button_min_w,
     tooltip_max_w,
+    tooltip_offset_y,
+    pad_tooltip_x,
+    pad_tooltip_y,
+    menu_max_w,
+    dialog_text_max_w,
 };
 
 pub const Gap = enum { none, xs, sm, md, lg, xl, xxl };
 pub const FontToken = enum { body, body_strong, small, title, mono };
-pub const Duration = enum { instant, fast, normal, slow, indeterminate };
+pub const Duration = enum { instant, fast, normal, slow, indeterminate, autoscroll };
 pub const Easing = enum { out, linear };
 
 pub const Visual = struct {
@@ -120,6 +126,12 @@ pub const Theme = struct {
     durations_ms: std.EnumArray(Duration, u16),
 
     pub fn default(mode: Mode, sys: platform.SystemAppearance) Theme {
+        return defaultWithAccent(mode, sys, null);
+    }
+
+    /// REQ-THEME-009：`fixed_accent` 为应用指定的固定强调色。指定时一律对它派生（S<0.15 仍回退表值）；
+    /// 未指定时按系统强调色：等于默认强调色或接近灰色取表值，否则派生。高对比度下忽略（REQ-THEME-035）。
+    pub fn defaultWithAccent(mode: Mode, sys: platform.SystemAppearance, fixed_accent: ?core.Color) Theme {
         var t = Theme{
             .mode = mode,
             .colors = .initFill(.{}),
@@ -133,9 +145,13 @@ pub const Theme = struct {
             fillHighContrast(&t, sys);
         } else {
             fillColors(&t.colors, mode == .dark);
-            var accent = sys.accent;
-            if (sys.high_contrast) accent = core.Color.fromHex(0x2F6EDF, 255);
-            t.deriveAccent(accent);
+            if (sys.high_contrast) {
+                t.fillAccentTable();
+            } else if (fixed_accent) |fa| {
+                t.deriveAccentFrom(fa, true);
+            } else {
+                t.deriveAccentFrom(sys.accent, false);
+            }
         }
         const b = if (sys.message_font.size_lpx >= 8 and sys.message_font.size_lpx <= 32)
             sys.message_font.size_lpx
@@ -186,19 +202,23 @@ pub const Theme = struct {
         return self.durations_ms.get(d);
     }
 
+    /// REQ-THEME-009：由系统强调色派生强调色族。系统强调色（丢弃 alpha）等于默认强调色
+    /// 或接近灰色（S < 0.15）时，强调色族直接取 REQ-THEME-007 表值，不派生。
     pub fn deriveAccent(self: *Theme, system_accent: core.Color) void {
+        self.deriveAccentFrom(system_accent, false);
+    }
+
+    /// `fixed`：为真表示该色是应用固定强调色，此时即使等于默认强调色也执行派生。
+    pub fn deriveAccentFrom(self: *Theme, system_accent: core.Color, fixed: bool) void {
         const hsl = rgbToHsl(system_accent);
-        var h = hsl.h;
-        var s = hsl.s;
-        if (s < 0.15) {
-            const fallback = if (self.mode == .dark) core.Color.fromHex(0x2F6FDE, 255) else core.Color.fromHex(0x2F6EDF, 255);
-            const f = rgbToHsl(fallback);
-            h = f.h;
-            s = f.s;
+        const is_default = system_accent.r == 0x2F and system_accent.g == 0x6E and system_accent.b == 0xDF;
+        if ((is_default and !fixed) or hsl.s < 0.15) {
+            self.fillAccentTable();
+            return;
         }
-        s = std.math.clamp(s, 0.55, 0.85);
-        var bottom_l: f32 = hsl.l;
-        // accent_fill_bottom：与白色对比度 ≥ 5.5 的最大 L（二分，单调）。
+        const h = hsl.h;
+        const s = std.math.clamp(hsl.s, 0.55, 0.85);
+        // accent_fill_bottom：与 text_on_accent（白）对比度 ≥ 5.5 的最大 L（二分，单调）。
         var lo: f32 = 0;
         var hi: f32 = 0.9;
         var i: usize = 0;
@@ -207,18 +227,20 @@ pub const Theme = struct {
             const c = hslToRgb(h, s, mid);
             if (core.Color.contrast(c, core.Color.white) >= 5.5) lo = mid else hi = mid;
         }
-        bottom_l = lo;
+        const bottom_l = lo;
         var top_l = @min(0.98, bottom_l + 0.05);
         while (top_l > bottom_l and core.Color.contrast(hslToRgb(h, s, top_l), core.Color.white) < 4.5) {
             top_l -= 0.005;
         }
-        const bottom = hslToRgb(h, s, bottom_l);
-        const top = hslToRgb(h, s, top_l);
-        const hover_top = hslToRgb(h, s, @min(0.99, top_l + 0.04));
-        const hover_bottom = hslToRgb(h, s, @min(0.99, bottom_l + 0.04));
+        const hover_top_l = hoverL(h, s, top_l);
+        const hover_bottom_l = hoverL(h, s, bottom_l);
+        const hover_top = hslToRgb(h, s, hover_top_l);
+        const hover_bottom = hslToRgb(h, s, hover_bottom_l);
         const pressed_top = hslToRgb(h, s, @max(0.02, bottom_l - 0.05));
         const pressed_bottom = hslToRgb(h, s, @max(0.02, top_l - 0.05));
         const border = hslToRgb(h, s, @max(0.02, bottom_l - 0.07));
+        const bottom = hslToRgb(h, s, bottom_l);
+        const top = hslToRgb(h, s, top_l);
         self.colors.set(.accent_fill_top, top);
         self.colors.set(.accent_fill_bottom, bottom);
         self.colors.set(.accent_fill_hover_top, hover_top);
@@ -236,6 +258,15 @@ pub const Theme = struct {
         self.colors.set(.accent_halo, self.color(.accent_mark).withAlpha(102));
     }
 
+    /// 把强调色族（全部 accent_*）置为 REQ-THEME-007 表中当前深浅模式的值。
+    fn fillAccentTable(self: *Theme) void {
+        var tab: std.EnumArray(ColorToken, core.Color) = .initFill(.{});
+        fillColors(&tab, self.mode == .dark);
+        for (std.enums.values(ColorToken)) |tk| {
+            if (std.mem.startsWith(u8, @tagName(tk), "accent_")) self.colors.set(tk, tab.get(tk));
+        }
+    }
+
     pub const ValidationReport = struct {
         checked: u32 = 0,
         failures: u32 = 0,
@@ -244,8 +275,23 @@ pub const Theme = struct {
 
     pub fn validate(self: *const Theme, out: *ValidationReport) bool {
         out.* = .{};
+        // REQ-THEME-008：text_primary 对全部 surface_*（禁用类除外）。
         const all_surfaces = [_]ColorToken{
-            .surface_window, .surface_panel, .surface_sunken, .surface_popup, .surface_row_alt,
+            .surface_window,
+            .surface_panel,
+            .surface_raised_top,
+            .surface_raised_bottom,
+            .surface_raised_hover_top,
+            .surface_raised_hover_bottom,
+            .surface_raised_pressed_top,
+            .surface_raised_pressed_bottom,
+            .surface_sunken,
+            .surface_track,
+            .surface_popup,
+            .surface_tooltip,
+            .surface_row_alt,
+            .surface_row_hover,
+            .surface_selection_inactive,
         };
         const secondary_surfaces = [_]ColorToken{
             .surface_window, .surface_panel, .surface_sunken, .surface_popup, .surface_row_alt,
@@ -260,13 +306,7 @@ pub const Theme = struct {
             .accent_fill_top,          .accent_fill_bottom,      .accent_fill_hover_top,
             .accent_fill_hover_bottom, .accent_fill_pressed_top, .accent_fill_pressed_bottom,
         };
-        for (fills) |bg| {
-            // 文档表格中 accent_fill_hover_top（#3F7BE6）与白字为 3.98:1；为保持
-            // 文档令牌值不被实现私自改写，这里对该悬停变体使用 3.9 的底线，
-            // 其余强调填充仍按 4.5 检查。
-            const min: f32 = if (bg == .accent_fill_hover_top) 3.9 else 4.5;
-            self.checkPair(out, .text_on_accent, bg, min);
-        }
+        for (fills) |bg| self.checkPair(out, .text_on_accent, bg, 4.5);
         for (accent_surfaces) |bg| {
             self.checkPair(out, .accent_text, bg, 4.5);
             self.checkPair(out, .accent_mark, bg, 3.0);
@@ -312,13 +352,14 @@ fn fillMetrics(m: *std.EnumArray(Metric, f32)) void {
     m.set(.pad_item_x, 8);
     m.set(.icon_sm, 16);
     m.set(.icon_md, 20);
+    m.set(.icon_lg, 32);
     m.set(.check_size, 14);
     m.set(.switch_w, 28);
     m.set(.switch_h, 14);
     m.set(.slider_track_h, 4);
     m.set(.slider_thumb_w, 10);
     m.set(.slider_thumb_h, 16);
-    m.set(.slider_min_len, 24);
+    m.set(.slider_min_len, 96);
     m.set(.tab_indicator_h, 2);
     m.set(.progress_h, 6);
     m.set(.scrollbar_w, 12);
@@ -328,6 +369,11 @@ fn fillMetrics(m: *std.EnumArray(Metric, f32)) void {
     m.set(.indent, 16);
     m.set(.button_min_w, 72);
     m.set(.tooltip_max_w, 320);
+    m.set(.tooltip_offset_y, 20);
+    m.set(.pad_tooltip_x, 6);
+    m.set(.pad_tooltip_y, 3);
+    m.set(.menu_max_w, 360);
+    m.set(.dialog_text_max_w, 420);
 }
 
 fn fillDurations(d: *std.EnumArray(Duration, u16)) void {
@@ -336,6 +382,7 @@ fn fillDurations(d: *std.EnumArray(Duration, u16)) void {
     d.set(.normal, 120);
     d.set(.slow, 200);
     d.set(.indeterminate, 1600);
+    d.set(.autoscroll, 50);
 }
 
 const light_values = struct {
@@ -372,7 +419,7 @@ const light_values = struct {
         .{ .t = .text_on_accent, .hex = 0xFFFFFF, .a = 255 },
         .{ .t = .accent_fill_top, .hex = 0x2F6EDF, .a = 255 },
         .{ .t = .accent_fill_bottom, .hex = 0x1F59C6, .a = 255 },
-        .{ .t = .accent_fill_hover_top, .hex = 0x3F7BE6, .a = 255 },
+        .{ .t = .accent_fill_hover_top, .hex = 0x3271E2, .a = 255 },
         .{ .t = .accent_fill_hover_bottom, .hex = 0x2A63CF, .a = 255 },
         .{ .t = .accent_fill_pressed_top, .hex = 0x1B50B4, .a = 255 },
         .{ .t = .accent_fill_pressed_bottom, .hex = 0x2259C2, .a = 255 },
@@ -421,7 +468,7 @@ const dark_values = struct {
         .{ .t = .text_on_accent, .hex = 0xFFFFFF, .a = 255 },
         .{ .t = .accent_fill_top, .hex = 0x2F6FDE, .a = 255 },
         .{ .t = .accent_fill_bottom, .hex = 0x2561CE, .a = 255 },
-        .{ .t = .accent_fill_hover_top, .hex = 0x3F7CE6, .a = 255 },
+        .{ .t = .accent_fill_hover_top, .hex = 0x3272E1, .a = 255 },
         .{ .t = .accent_fill_hover_bottom, .hex = 0x2F6AD6, .a = 255 },
         .{ .t = .accent_fill_pressed_top, .hex = 0x1F55B8, .a = 255 },
         .{ .t = .accent_fill_pressed_bottom, .hex = 0x255DC2, .a = 255 },
@@ -714,6 +761,15 @@ pub fn drawMark(ctx: *const DrawCtx, kind: MarkKind, r: core.Rect, color: ColorT
 
 fn cy(r: core.Rect) f32 {
     return r.y + r.h * 0.5;
+}
+
+/// 悬停变体亮度：L + 0.04；与白字对比度 < 4.5 时减小增量直至满足（REQ-THEME-009 第 5 步）。
+fn hoverL(h: f32, s: f32, l: f32) f32 {
+    var inc: f32 = 0.04;
+    while (inc > 0 and core.Color.contrast(hslToRgb(h, s, @min(0.99, l + inc)), core.Color.white) < 4.5) {
+        inc -= 0.005;
+    }
+    return @min(0.99, l + @max(inc, 0));
 }
 
 fn findL(h: f32, s: f32, against: core.Color, min_ratio: f32, darker_is_better: bool) f32 {

@@ -227,7 +227,7 @@ pub fn quantizeWeight(weight: f32) u32 {
 }
 
 /// 最大余数法（REQ-LAYOUT-015）。
-pub fn apportion(total: i32, weights: []const u64, out: []i32) void {
+pub fn apportion(scratch: std.mem.Allocator, total: i32, weights: []const u64, out: []i32) void {
     var wsum: u64 = 0;
     for (weights) |w| wsum += w;
     if (out.len == 0) return;
@@ -243,12 +243,13 @@ pub fn apportion(total: i32, weights: []const u64, out: []i32) void {
         sum += share;
     }
     var remainder: i64 = @as(i64, total) - sum;
-    var used: [128]bool = @splat(false);
+    const used = scratch.alloc(bool, out.len) catch @panic("nano_gui: layout scratch exhausted");
+    @memset(used, false);
     while (remainder > 0) {
         var best: ?usize = null;
         var best_rem: u64 = 0;
         for (weights, 0..) |w, i| {
-            if (i >= out.len or i >= used.len) break;
+            if (i >= out.len) break;
             if (used[i]) continue;
             const rem: u64 = (@as(u64, @intCast(total)) * w) % wsum;
             if (best == null or rem > best_rem) {
@@ -273,14 +274,19 @@ fn clamp(v: i32, lo: i32, hi: i32) i32 {
 }
 
 /// 线性容器主轴分配（REQ-LAYOUT-016 至 REQ-LAYOUT-019）。
-pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeResult {
+pub fn distribute(scratch: std.mem.Allocator, items: []const FlexItem, avail: i32, out: []i32) DistributeResult {
     std.debug.assert(out.len == items.len);
     if (items.len == 0) return .{ .overflow = 0, .leftover = @max(0, avail) };
     var non_grow_sum: i64 = 0;
     var grow_min_sum: i64 = 0;
-    var b: [128]i32 = undefined;
+    // 临时数组均取自调用方给的帧竞技场，不设子项数上限（REQ-ARCH-011）。
+    const n_items = items.len;
+    const b = scratch.alloc(i32, n_items) catch @panic("nano_gui: layout scratch exhausted");
+    const weights = scratch.alloc(u64, n_items) catch @panic("nano_gui: layout scratch exhausted");
+    const shares = scratch.alloc(i32, n_items) catch @panic("nano_gui: layout scratch exhausted");
+    const flags = scratch.alloc(bool, n_items) catch @panic("nano_gui: layout scratch exhausted");
+    const ideal = scratch.alloc(i64, n_items) catch @panic("nano_gui: layout scratch exhausted");
     for (items, 0..) |it, i| {
-        if (i >= b.len) break;
         if (it.kind == .grow) {
             b[i] = it.min;
             grow_min_sum += it.min;
@@ -290,7 +296,6 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
         }
     }
     for (items, 0..) |_, i| {
-        if (i >= b.len) break;
         out[i] = b[i];
     }
     const overflow_i: i64 = non_grow_sum + grow_min_sum - avail;
@@ -298,28 +303,23 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
         // grow 一律取 min（已如此），再收缩 fit_shrink。
         var total_slack: i64 = 0;
         for (items, 0..) |it, i| {
-            if (i >= b.len) break;
             if (it.kind == .shrink) total_slack += @max(0, b[i] - it.min);
         }
         var take: i64 = @min(overflow_i, total_slack);
         const remain_overflow: i32 = @intCast(@max(0, overflow_i - take));
         if (take > 0) {
-            var weights: [128]u64 = undefined;
-            var red: [128]i32 = undefined;
             var n: usize = 0;
             for (items, 0..) |it, i| {
-                if (i >= b.len) break;
                 if (it.kind == .shrink) {
                     weights[n] = @intCast(@max(0, b[i] - it.min));
-                    red[0] = 0;
                     n += 1;
                 }
             }
-            var reds: [128]i32 = @splat(0);
-            apportion(@intCast(take), weights[0..n], reds[0..n]);
+            const reds = shares;
+            @memset(reds, 0);
+            apportion(scratch, @intCast(take), weights[0..n], reds[0..n]);
             var k: usize = 0;
             for (items, 0..) |it, i| {
-                if (i >= b.len) break;
                 if (it.kind == .shrink) {
                     const r: i32 = @min(reds[k], b[i] - it.min);
                     out[i] = b[i] - r;
@@ -342,9 +342,9 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
 
     // 冻结法分配 grow。
     var remaining: i64 = @as(i64, avail) - non_grow_sum;
-    var active: [128]bool = @splat(false);
+    const active = flags;
+    @memset(active, false);
     for (items, 0..) |it, i| {
-        if (i >= b.len) break;
         if (it.kind == .grow) {
             if (it.wq == 0) {
                 out[i] = it.min;
@@ -358,7 +358,6 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
         var wsum: u64 = 0;
         var count: usize = 0;
         for (items, 0..) |it, i| {
-            if (i >= b.len) break;
             if (active[i]) {
                 wsum += it.wq;
                 count += 1;
@@ -369,9 +368,7 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
         var vsum: i64 = 0;
         var any_low = false;
         var any_high = false;
-        var ideal: [128]i64 = undefined;
         for (items, 0..) |it, i| {
-            if (i >= b.len) break;
             if (!active[i]) continue;
             ideal[i] = @divTrunc(remaining * @as(i64, it.wq), @as(i64, @intCast(wsum)));
             if (ideal[i] < it.min) {
@@ -385,20 +382,16 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
             }
         }
         if (!violated) {
-            var weights: [128]u64 = undefined;
-            var shares: [128]i32 = undefined;
             var n: usize = 0;
             for (items, 0..) |it, i| {
-                if (i >= b.len) break;
                 if (active[i]) {
                     weights[n] = it.wq;
                     n += 1;
                 }
             }
-            apportion(@intCast(@max(0, remaining)), weights[0..n], shares[0..n]);
+            apportion(scratch, @intCast(@max(0, remaining)), weights[0..n], shares[0..n]);
             var k: usize = 0;
             for (items, 0..) |it, i| {
-                if (i >= b.len) break;
                 if (active[i]) {
                     out[i] = clamp(shares[k], it.min, it.max);
                     k += 1;
@@ -409,7 +402,6 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
         var freeze_low = any_low and (!any_high or vsum >= 0);
         if (vsum < 0) freeze_low = false;
         for (items, 0..) |it, i| {
-            if (i >= b.len) break;
             if (!active[i]) continue;
             if ((freeze_low and ideal[i] < it.min) or (!freeze_low and ideal[i] > it.max) or (vsum == 0)) {
                 const val = if (ideal[i] < it.min) it.min else it.max;
@@ -424,12 +416,11 @@ pub fn distribute(items: []const FlexItem, avail: i32, out: []i32) DistributeRes
     return .{ .overflow = 0, .leftover = @intCast(@max(0, @as(i64, avail) - total)) };
 }
 
-pub fn solveColumns(cols: []const Column, header_widths: []const i32, inner_w: i32, definite: bool, gap: i32, scale: f32, out: []i32) void {
+pub fn solveColumns(scratch: std.mem.Allocator, cols: []const Column, header_widths: []const i32, inner_w: i32, definite: bool, gap: i32, scale: f32, out: []i32) void {
     std.debug.assert(out.len == cols.len);
     if (cols.len == 0) return;
-    var items: [64]FlexItem = undefined;
+    const items = scratch.alloc(FlexItem, cols.len) catch @panic("nano_gui: layout scratch exhausted");
     for (cols, 0..) |c, i| {
-        if (i >= items.len) break;
         const min = pxValue(c.min, scale);
         const max = if (c.max == std.math.inf(f32)) unbounded else pxValue(c.max, scale);
         switch (c.width) {
@@ -443,11 +434,7 @@ pub fn solveColumns(cols: []const Column, header_widths: []const i32, inner_w: i
     }
     const gaps: i32 = if (cols.len > 1) gap * @as(i32, @intCast(cols.len - 1)) else 0;
     const avail = if (definite) @max(0, inner_w - gaps) else unbounded;
-    var res: [64]i32 = undefined;
-    _ = distribute(items[0..cols.len], avail, res[0..cols.len]);
-    for (res[0..cols.len], 0..) |v, i| {
-        if (i < out.len) out[i] = v;
-    }
+    _ = distribute(scratch, items, avail, out);
 }
 
 fn pxValue(v: f32, scale: f32) i32 {
@@ -563,8 +550,10 @@ pub fn placeAnchored(anchor: core.RectI, size_in: SizeI, placement: Placement, g
 }
 
 test "apportion and distribute basics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var out: [3]i32 = undefined;
-    apportion(300, &.{ 1024, 1024, 1024 }, &out);
+    apportion(arena.allocator(), 300, &.{ 1024, 1024, 1024 }, &out);
     try std.testing.expectEqualSlices(i32, &.{ 100, 100, 100 }, &out);
 
     var items = [3]FlexItem{
@@ -573,26 +562,28 @@ test "apportion and distribute basics" {
         .{ .kind = .grow, .base = 0, .min = 0, .max = unbounded, .wq = 1024 },
     };
     var res: [3]i32 = undefined;
-    var r = distribute(&items, 300, &res);
+    var r = distribute(arena.allocator(), &items, 300, &res);
     try std.testing.expectEqualSlices(i32, &.{ 100, 100, 100 }, &res);
     try std.testing.expectEqual(@as(i32, 0), r.overflow);
 
-    r = distribute(&items, 301, &res);
+    r = distribute(arena.allocator(), &items, 301, &res);
     try std.testing.expectEqualSlices(i32, &.{ 101, 100, 100 }, &res);
 
     items[0].max = 50;
-    r = distribute(&items, 300, &res);
+    r = distribute(arena.allocator(), &items, 300, &res);
     try std.testing.expectEqualSlices(i32, &.{ 50, 125, 125 }, &res);
 }
 
 test "distribute shrink" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var items = [3]FlexItem{
         .{ .kind = .shrink, .base = 200, .min = 80, .max = unbounded, .wq = 0 },
         .{ .kind = .shrink, .base = 150, .min = 50, .max = unbounded, .wq = 0 },
         .{ .kind = .fixed, .base = 100, .min = 0, .max = unbounded, .wq = 0 },
     };
     var res: [3]i32 = undefined;
-    const r = distribute(&items, 300, &res);
+    const r = distribute(arena.allocator(), &items, 300, &res);
     try std.testing.expectEqualSlices(i32, &.{ 118, 82, 100 }, &res);
     try std.testing.expectEqual(@as(i32, 0), r.overflow);
 }

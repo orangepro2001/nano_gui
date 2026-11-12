@@ -2711,7 +2711,7 @@ pub fn beginTable(ui_ptr: *Ui, src: std.builtin.SourceLocation, columns: []const
     const approx_w: i32 = @intFromFloat(@max(200, @as(f32, @floatFromInt(ui_ptr.viewport.w)) - 32));
     const layout_cols = ui_ptr.treeAlloc().alloc(layout.Column, columns.len) catch @panic("nano_gui: table columns");
     for (columns, 0..) |col, i| layout_cols[i] = .{ .width = col.width, .min = col.min, .max = col.max };
-    layout.solveColumns(layout_cols, header_w, approx_w, true, 0, ui_ptr.scale, tmp);
+    layout.solveColumns(ui_ptr.frameAlloc(), layout_cols, header_w, approx_w, true, 0, ui_ptr.scale, tmp);
     for (tmp, 0..) |v, i| widths[i] = @as(f32, @floatFromInt(v));
     _ = ui_ptr.beginRow(src, .{ .main = .fixedSize(t.metric(.header_h)), .cross = .fill, .gap = .none, .cross_align = .center });
     for (columns, 0..) |col, i| {
@@ -2896,7 +2896,14 @@ pub fn beginDialogBody(ui_ptr: *Ui, src: std.builtin.SourceLocation, opts: Dialo
 pub fn endDialogBody(ui_ptr: *Ui) void {
     ui_ptr.endColumn();
 }
-pub fn dialogButtons(ui_ptr: *Ui, src: std.builtin.SourceLocation, buttons: []const @import("app.zig").DialogButton) ?u32 {
+pub const ButtonRole = enum { normal, default, cancel, default_and_cancel };
+pub const DialogButton = struct {
+    label: []const u8,
+    code: u32,
+    role: ButtonRole = .normal,
+    enabled: bool = true,
+};
+pub fn dialogButtons(ui_ptr: *Ui, src: std.builtin.SourceLocation, buttons: []const DialogButton) ?u32 {
     if (buttons.len == 0) return null;
     _ = ui_ptr.beginRow(src, .{ .main = .fit, .cross = .fit, .gap = .sm, .justify = .end, .cross_align = .center });
     var result: ?u32 = null;
@@ -3115,4 +3122,24 @@ pub fn beginTabsRetained(ui_ptr: *Ui, src: std.builtin.SourceLocation, tabs_spec
 }
 pub fn endTabs(ui_ptr: *Ui) void {
     ui_ptr.endColumn();
+}
+
+/// 测试观测入口（13 的 REQ-TEST-014 `expect text`）：返回节点当前显示的完整文本，只读。
+/// 目前覆盖 label、button、checkbox/radio/switch；其余控件返回 null。
+pub fn nodeText(node: *const Node) ?[]const u8 {
+    const f = node.paint orelse return null;
+    const props = node.props orelse return null;
+    if (f == &paintLabel) {
+        const p: *const LabelProps = @ptrCast(@alignCast(props));
+        return p.label;
+    }
+    if (f == &paintButton) {
+        const p: *const ButtonProps = @ptrCast(@alignCast(props));
+        return p.label;
+    }
+    if (f == &paintToggle) {
+        const p: *const ToggleProps = @ptrCast(@alignCast(props));
+        return p.label;
+    }
+    return null;
 }

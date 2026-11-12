@@ -66,13 +66,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // 检查模式绝不自动生成基准（REQ-TEST-011）：缺失即失败，且不写入 tests/golden/。
     const baseline = nano.app.readPng(gpa, io, case_path) catch |e| {
         if (e == error.FileNotFound) {
-            try app.savePngIo(io, case_path);
-            try std.Io.File.stdout().writeStreamingAll(io, "golden: 基准不存在，已创建 ");
-            try std.Io.File.stdout().writeStreamingAll(io, case_path);
-            try std.Io.File.stdout().writeStreamingAll(io, "\n");
-            return;
+            const msg = try std.fmt.allocPrint(gpa, "golden: 基准不存在 {s}（用 --write 生成并单独提交，REQ-TEST-011）\n", .{case_path});
+            defer gpa.free(msg);
+            try std.Io.File.stderr().writeStreamingAll(io, msg);
+            std.process.exit(1);
         }
         return e;
     };
@@ -82,7 +82,20 @@ pub fn main(init: std.process.Init) !void {
     }
     const actual = app.surface.pixels;
     if (baseline.width != app.surface.width or baseline.height != app.surface.height or baseline.rgba.len != actual.len) {
+        // 尺寸不一致：输出实际图与全红差异图（REQ-GFX-040 第 5 条：红色标出超差像素）（REQ-TEST-010），不覆盖基准。
         try app.savePngIo(io, actual_path);
+        const red_fill = try gpa.alloc(u8, actual.len);
+        defer gpa.free(red_fill);
+        var k: usize = 0;
+        while (k < red_fill.len) : (k += 4) {
+            red_fill[k] = 255;
+            red_fill[k + 1] = 0;
+            red_fill[k + 2] = 0;
+            red_fill[k + 3] = 255;
+        }
+        const png = try nano.gfx.encodePng(gpa, red_fill, app.surface.width, app.surface.height);
+        defer gpa.free(png);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = diff_path, .data = png });
         try std.Io.File.stderr().writeStreamingAll(io, "golden: 尺寸不一致\n");
         std.process.exit(1);
     }
@@ -98,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
             if (diff_count == 1) first = i;
             diff[o] = 255;
             diff[o + 1] = 0;
-            diff[o + 2] = 255;
+            diff[o + 2] = 0;
             diff[o + 3] = 255;
         }
     }

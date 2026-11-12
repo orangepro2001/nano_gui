@@ -177,6 +177,14 @@ pub const Ui = struct {
     frame_now: u64 = 0,
     pass: u8 = 0,
     dirty: Dirty = .build,
+    /// 构建期间发出的失效（REQ-FRAME-023）：构建结束时与 .layout 取较高者并入 dirty。
+    pending_dirty: Dirty = .none,
+    /// 需要延续到下一帧的失效（构建期间合并的 .build），在 finishFrame 清除 dirty 后写回。
+    carry_dirty: Dirty = .none,
+    /// 当前是否处于构建遍内。
+    building: bool = false,
+    /// 初始焦点是否已设置过（REQ-INPUT-043：仅根首次构建完成后）。
+    initial_focus_done: bool = false,
     invalidated_rects: std.ArrayListUnmanaged(core.RectI) = .empty,
     damage: core.RectI = .{},
     viewport: core.Size2i = .{ .w = 800, .h = 600 },
@@ -702,6 +710,10 @@ pub const Ui = struct {
 
     // ---- 失效 ----
     pub fn invalidate(self: *Ui, level: Dirty) void {
+        if (self.building) {
+            if (@backingInt(level) > @backingInt(self.pending_dirty)) self.pending_dirty = level;
+            return;
+        }
         if (@backingInt(level) > @backingInt(self.dirty)) self.dirty = level;
     }
     pub fn invalidateNode(self: *Ui, widget_id: core.WidgetId, level: Dirty) void {
@@ -723,7 +735,8 @@ pub const Ui = struct {
     }
     pub fn requestRebuild(self: *Ui) void {
         self.rebuild_requested = true;
-        self.invalidate(.build);
+        // 构建内的重建请求由第二遍处理，不并入待处理失效；构建外照常置构建脏。
+        if (!self.building) self.invalidate(.build);
     }
     pub fn afterFrame(self: *Ui, closure: core.Closure) void {
         self.after_frame.append(self.gpa, closure) catch {};
@@ -1388,6 +1401,8 @@ pub const Ui = struct {
         if (self.dirty != .build and !self.force_rebuild) return;
         const old_root = self.current_root;
         self.popup_rect = null;
+        self.building = true;
+        self.pending_dirty = .none;
         var pass: u8 = 1;
         while (pass <= 2) : (pass += 1) {
             self.pass = pass;
@@ -1415,6 +1430,7 @@ pub const Ui = struct {
             self.parent_stack.append(self.gpa, root) catch {};
             text.beginBuild();
             buildFn(ctx, self);
+            text.trimCache();
             if (self.parent_stack.items.len != 1) {
                 @panic("nano_gui: begin/end 不配对（REQ-FRAME-028）");
             }
@@ -1424,7 +1440,11 @@ pub const Ui = struct {
             core.stats.counter("frame.build_passes").* += 1;
             const needs_second = self.activation_seen or self.rebuild_requested;
             if (!needs_second) break;
-            if (pass == 2) break;
+            if (pass == 2) {
+                // REQ-FRAME-032：两遍之后条件仍在，以当前结果完成本帧并请求下一帧。
+                if (self.rebuild_requested) self.pending_dirty = .build;
+                break;
+            }
             self.activation_seen = false;
             self.rebuild_requested = false;
         }
@@ -1467,7 +1487,11 @@ pub const Ui = struct {
             self.removeState(v);
             sticky_count -= 1;
         }
-        self.dirty = .layout;
+        self.building = false;
+        // 合并构建期间的失效：取 max(待处理, .layout)（REQ-FRAME-023/032）。
+        self.dirty = if (@backingInt(self.pending_dirty) > @backingInt(Dirty.layout)) self.pending_dirty else .layout;
+        if (@backingInt(self.pending_dirty) > @backingInt(Dirty.layout)) self.carry_dirty = self.pending_dirty;
+        self.pending_dirty = .none;
         self.applyPostBuildFocus();
     }
 
@@ -1490,12 +1514,14 @@ pub const Ui = struct {
                 if (self.current_root) |r| tabStops(r, &list, self.gpa);
                 if (list.items.len > 0) self.focus_id = list.items[0].id;
             }
-        } else {
+        } else if (!self.initial_focus_done) {
+            // 初始焦点只在根首次构建完成后设置一次（REQ-INPUT-043），之后 clearFocus 保持为空。
             var list = std.ArrayListUnmanaged(*Node).empty;
             defer list.deinit(self.gpa);
             if (self.current_root) |r| tabStops(r, &list, self.gpa);
             if (list.items.len > 0) self.focus_id = list.items[0].id;
         }
+        self.initial_focus_done = true;
     }
 
     fn collectMap(node: ?*Node, map: *std.AutoHashMapUnmanaged(u64, *Node), gpa: std.mem.Allocator) void {
@@ -1688,7 +1714,7 @@ pub const Ui = struct {
                 var sizes = std.ArrayListUnmanaged(i32).empty;
                 defer sizes.deinit(self.gpa);
                 sizes.appendNTimes(self.gpa, 0, children.items.len) catch {};
-                const dr = layout.distribute(items.items, @max(0, avail - gap_total), sizes.items);
+                const dr = layout.distribute(self.frameAlloc(), items.items, @max(0, avail - gap_total), sizes.items);
                 _ = dr;
                 var pos = if (vertical) inner.y else inner.x;
                 for (children.items, 0..) |ch, i| {
@@ -1946,10 +1972,8 @@ pub const Ui = struct {
 
     pub fn paint(self: *Ui, surface: *gfx.Surface) bool {
         if (self.current_root == null) return false;
-        if (self.damage.isEmpty()) {
-            self.dirty = .none;
-            return false;
-        }
+        // 脏标记的清除统一在 finishFrame（每帧必经），paint 不再清除。
+        if (self.damage.isEmpty()) return false;
         const canvas = surface.beginFrame(self.damage, self.scale);
         var ctx = PaintCtx{
             .draw = .{ .canvas = canvas, .theme = self.theme_ptr, .scale = self.scale, .window_active = self.window_active },
@@ -1980,9 +2004,7 @@ pub const Ui = struct {
             w.present_h = surface.height;
             platform.present(w);
         }
-        self.dirty = .none;
         self.frame_count += 1;
-        _ = core.stats.gauge("frame.damage_area");
         core.stats.counter("frame.damage_area_ppx").* += @intCast(@max(0, self.damage.area()));
         core.stats.counter("frame.nodes_painted").* += self.painted_nodes;
         core.stats.counter("frame.presents").* += 1;
@@ -2024,6 +2046,10 @@ pub const Ui = struct {
             if (kv.value_ptr.touched + 2 < self.build_counter) tdel.append(self.gpa, kv.key_ptr.*) catch {};
         }
         for (tdel.items) |k| _ = self.timers.remove(k);
+        // 本帧已处理完：不论是否绘制都在此清除脏标记，再写回需要下一帧的失效
+        // （REQ-FRAME-023/032）；帧后动作在其后执行，其发出的失效自然进入下一帧。
+        self.dirty = self.carry_dirty;
+        self.carry_dirty = .none;
         // 帧后动作在帧状态清除后执行。
         self.frame.reset();
         self.clearInbox();

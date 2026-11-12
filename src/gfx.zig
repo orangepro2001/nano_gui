@@ -222,9 +222,16 @@ pub const images = struct {
         switch (set) {
             .single => |s| return s.key,
             .variants => |vs| {
+                // REQ-GFX-034：取 scale_pct >= s 的最小档；不存在则取最大档。
                 var best = vs[0];
+                var found = false;
                 for (vs) |v| {
-                    if (v.scale_pct <= pct and v.scale_pct >= best.scale_pct) best = v;
+                    if (v.scale_pct >= pct) {
+                        if (!found or v.scale_pct < best.scale_pct) best = v;
+                        found = true;
+                    } else if (!found and v.scale_pct > best.scale_pct) {
+                        best = v;
+                    }
                 }
                 return best.key;
             },
@@ -389,7 +396,8 @@ pub const Canvas = struct {
         if (clipped.isEmpty()) return;
         var y = clipped.y;
         while (y < clipped.bottom()) : (y += 1) {
-            const t = if (ri.h <= 1) 0.0 else @as(f32, @floatFromInt(y - ri.y)) + 0.5 / @as(f32, @floatFromInt(ri.h));
+            // 顶行取起点色，底行取终点色（REQ-GFX-011）。
+            const t = if (ri.h <= 1) 0.0 else @as(f32, @floatFromInt(y - ri.y)) / @as(f32, @floatFromInt(ri.h - 1));
             const c = core.Color.lerp(top, bottom, t);
             var x = clipped.x;
             while (x < clipped.right()) : (x += 1) self.putPixel(x, y, c, 1.0);
@@ -439,7 +447,8 @@ pub const Canvas = struct {
         const hh = @as(f32, @floatFromInt(ri.h)) * 0.5;
         var y = clipped.y;
         while (y < clipped.bottom()) : (y += 1) {
-            const t = if (ri.h <= 1) 0.0 else @as(f32, @floatFromInt(y - ri.y)) + 0.5 / @as(f32, @floatFromInt(ri.h));
+            // 顶行取起点色，底行取终点色（REQ-GFX-011）。
+            const t = if (ri.h <= 1) 0.0 else @as(f32, @floatFromInt(y - ri.y)) / @as(f32, @floatFromInt(ri.h - 1));
             const c = core.Color.lerp(top, bottom, t);
             var x = clipped.x;
             while (x < clipped.right()) : (x += 1) {
@@ -624,7 +633,7 @@ pub const Canvas = struct {
                 if (sx >= e.pixels.width or sy >= e.pixels.height) continue;
                 const idx = (sy * e.pixels.width + sx) * 4;
                 var c = core.Color{ .r = e.pixels.rgba[idx], .g = e.pixels.rgba[idx + 1], .b = e.pixels.rgba[idx + 2], .a = e.pixels.rgba[idx + 3] };
-                if (opts.tint) |t| c = .{ .r = c.r * t.r / 255, .g = c.g * t.g / 255, .b = c.b * t.b / 255, .a = c.a * t.a / 255 };
+                if (opts.tint) |t| c = .{ .r = tintMul(c.r, t.r), .g = tintMul(c.g, t.g), .b = tintMul(c.b, t.b), .a = tintMul(c.a, t.a) };
                 self.putPixel(x, y, c, 1.0);
             }
         }
@@ -869,6 +878,11 @@ fn writeChunk(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), ki
     try writeU32(out, allocator, crc.final());
 }
 
+/// 逐通道着色相乘（先提升到 u16 避免 u8 溢出），带四舍五入。
+fn tintMul(a: u8, b: u8) u8 {
+    return @intCast((@as(u16, a) * @as(u16, b) + 127) / 255);
+}
+
 pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Pixels {
     if (bytes.len < 8) return error.DecodeFailed;
     var pos: usize = 8;
@@ -880,13 +894,18 @@ pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Pi
     while (pos + 12 <= bytes.len) {
         const len = std.mem.readInt(u32, bytes[pos .. pos + 4][0..4], .big);
         const kind = bytes[pos + 4 .. pos + 8];
+        // chunk 长度不得超出剩余数据（含 4 字节 CRC）。
+        if (@as(u64, len) + 12 > bytes.len - pos) return error.DecodeFailed;
         const data = bytes[pos + 8 .. pos + 8 + len];
-        pos += 12 + len;
+        pos += 12 + @as(usize, len);
         if (std.mem.eql(u8, kind, "IHDR")) {
             if (data.len < 13) return error.DecodeFailed;
             w = std.mem.readInt(u32, data[0..4], .big);
             h = std.mem.readInt(u32, data[4..8], .big);
             if (data[8] != 8 or data[9] != 6) return error.UnsupportedFormat;
+            // 先查尺寸再分配（REQ-GFX-030）。
+            if (w == 0 or h == 0) return error.DecodeFailed;
+            if (w > 16384 or h > 16384 or @as(u64, w) * h > 64 * 1024 * 1024) return error.TooLarge;
         } else if (std.mem.eql(u8, kind, "IDAT")) {
             try idat.appendSlice(allocator, data);
         } else if (std.mem.eql(u8, kind, "IEND")) {

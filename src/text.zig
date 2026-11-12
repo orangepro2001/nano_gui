@@ -21,8 +21,173 @@ pub fn setDirectWrite(enabled: bool) void {
     use_directwrite = enabled;
     if (enabled) _ = directwrite.ensureFactory();
 }
-var layout_cache: [32]?*Layout = @splat(null);
-var layout_cache_idx: usize = 0;
+
+// 排版缓存（REQ-TEXT-013/014）：按键哈希索引，LRU 淘汰；
+// 条目记录最后触达的构建代，淘汰只选 last_gen < 当前代 - 1 的条目。
+/// 仅供测试：强制所有键得到相同哈希，以验证碰撞时按原文比对。
+pub var test_hash_override: ?u64 = null;
+
+const CacheKey = struct {
+    style: Style,
+    max_width_ppx: i32,
+    has_max_width: bool,
+    wrap: Wrap,
+    ellipsis: Ellipsis,
+    max_lines: u32,
+    newlines: Newlines,
+    tab_width: u8,
+    line_height_ppx: i32,
+    has_line_height: bool,
+    @"align": Align,
+    scale_milli: i32,
+
+    fn make(style: Style, scale: f32, opts: LayoutOptions) CacheKey {
+        return .{
+            .style = style,
+            .max_width_ppx = if (opts.max_width) |w| @intFromFloat(@round(w * scale)) else 0,
+            .has_max_width = opts.max_width != null,
+            .wrap = opts.wrap,
+            .ellipsis = opts.ellipsis,
+            .max_lines = opts.max_lines orelse 0,
+            .newlines = opts.newlines,
+            .tab_width = opts.tab_width,
+            .line_height_ppx = if (opts.line_height) |h| @intFromFloat(@round(h * scale)) else 0,
+            .has_line_height = opts.line_height != null,
+            .@"align" = opts.@"align",
+            .scale_milli = @intFromFloat(@round(scale * 1000)),
+        };
+    }
+
+    fn eql(a: CacheKey, b: CacheKey) bool {
+        return a.style.family == b.style.family and a.style.size == b.style.size and
+            a.style.weight == b.style.weight and a.style.italic == b.style.italic and
+            a.max_width_ppx == b.max_width_ppx and a.has_max_width == b.has_max_width and
+            a.wrap == b.wrap and a.ellipsis == b.ellipsis and a.max_lines == b.max_lines and
+            a.newlines == b.newlines and a.tab_width == b.tab_width and
+            a.line_height_ppx == b.line_height_ppx and a.has_line_height == b.has_line_height and
+            a.@"align" == b.@"align" and a.scale_milli == b.scale_milli;
+    }
+
+    fn hash(k: CacheKey, text: []const u8) u64 {
+        if (test_hash_override) |o| return o;
+        var h = std.hash.Wyhash.init(0);
+        h.update(text);
+        h.update(std.mem.asBytes(&@backingInt(k.style.family)));
+        h.update(std.mem.asBytes(&k.style.size));
+        h.update(std.mem.asBytes(&k.style.weight));
+        h.update(std.mem.asBytes(&k.style.italic));
+        h.update(std.mem.asBytes(&k.max_width_ppx));
+        h.update(std.mem.asBytes(&k.has_max_width));
+        h.update(std.mem.asBytes(&@backingInt(k.wrap)));
+        h.update(std.mem.asBytes(&@backingInt(k.ellipsis)));
+        h.update(std.mem.asBytes(&k.max_lines));
+        h.update(std.mem.asBytes(&@backingInt(k.newlines)));
+        h.update(std.mem.asBytes(&k.tab_width));
+        h.update(std.mem.asBytes(&k.line_height_ppx));
+        h.update(std.mem.asBytes(&k.has_line_height));
+        h.update(std.mem.asBytes(&@backingInt(k.@"align")));
+        h.update(std.mem.asBytes(&k.scale_milli));
+        return h.final();
+    }
+};
+
+const CacheEntry = struct {
+    key: CacheKey,
+    hash: u64,
+    src_text: []u8, // 原文完整副本（命中时逐字节比对）
+    layout: *Layout,
+    bytes: usize,
+    last_gen: u64,
+    chain: ?*CacheEntry = null, // 同哈希链
+    prev: ?*CacheEntry = null, // LRU 链：head 最新，tail 最旧
+    next: ?*CacheEntry = null,
+};
+
+var cache_map: std.AutoHashMapUnmanaged(u64, *CacheEntry) = .empty;
+var cache_head: ?*CacheEntry = null;
+var cache_tail: ?*CacheEntry = null;
+var cache_entries: usize = 0;
+var cache_bytes: usize = 0;
+var cache_gen: u64 = 1;
+var cache_max_entries: usize = 4096;
+var cache_max_bytes: usize = 8 * 1024 * 1024;
+
+fn lruUnlink(e: *CacheEntry) void {
+    if (e.prev) |p| p.next = e.next else cache_head = e.next;
+    if (e.next) |n| n.prev = e.prev else cache_tail = e.prev;
+    e.prev = null;
+    e.next = null;
+}
+
+fn lruPushFront(e: *CacheEntry) void {
+    e.prev = null;
+    e.next = cache_head;
+    if (cache_head) |h| h.prev = e;
+    cache_head = e;
+    if (cache_tail == null) cache_tail = e;
+}
+
+/// 排版缓存当前占用（与埋点 cache.text_layout.entries/bytes 同源）。
+/// 编程错误断言（REQ-CONV-013）：使用排版接口前必须先调用 text.init（REQ-ARCH-011）。
+/// 不用 assert 后接 `.?`：发布构建中 assert 被移除，`.?` 会变成未定义行为。
+fn requireInit(src: std.builtin.SourceLocation) std.mem.Allocator {
+    if (backend_allocator) |a| return a;
+    std.debug.panic("nano_gui: 违反 REQ-ARCH-011：调用 text 接口前未调用 text.init（调用点 {s}:{d}）", .{ src.file, src.line });
+}
+
+/// 内存耗尽属于不可恢复的环境错误（REQ-ARCH-017、REQ-ARCH-018），经 platform.fatal 退出。
+fn outOfMemory() noreturn {
+    platform.fatal("nano_gui", "文字排版缓存分配失败：内存耗尽");
+}
+
+pub fn cacheStats() struct { entries: usize, bytes: usize } {
+    return .{ .entries = cache_entries, .bytes = cache_bytes };
+}
+
+fn cacheReport() void {
+    core.stats.gauge("cache.text_layout.entries").* = cache_entries;
+    core.stats.gauge("cache.text_layout.bytes").* = cache_bytes;
+}
+
+fn cacheRemove(e: *CacheEntry) void {
+    lruUnlink(e);
+    // 从哈希链摘除。
+    if (cache_map.get(e.hash)) |head| {
+        if (head == e) {
+            if (e.chain) |c| cache_map.putAssumeCapacity(e.hash, c) else _ = cache_map.remove(e.hash);
+        } else {
+            var cur = head;
+            while (cur.chain) |n| : (cur = n) {
+                if (n == e) {
+                    cur.chain = e.chain;
+                    break;
+                }
+            }
+        }
+    }
+    cache_entries -= 1;
+    cache_bytes -= e.bytes;
+    const alloc = e.layout.allocator;
+    alloc.free(e.src_text);
+    e.layout.deinit();
+    alloc.destroy(e);
+}
+
+/// 淘汰超限条目；只淘汰最后触达代 < 当前代 - 1 的条目（REQ-TEXT-014）。
+fn cacheEvict() void {
+    while (cache_entries > cache_max_entries or cache_bytes > cache_max_bytes) {
+        const t = cache_tail orelse return;
+        if (t.last_gen + 1 >= cache_gen) return; // 最旧的都受保护：允许暂时超限
+        cacheRemove(t);
+    }
+}
+
+fn cacheClear() void {
+    while (cache_tail) |t| cacheRemove(t);
+    if (backend_allocator) |a| cache_map.deinit(a);
+    cache_map = .empty;
+    cacheReport();
+}
 
 pub const backend_name: []const u8 = "fixed";
 pub const directwrite = @import("text/directwrite.zig");
@@ -140,20 +305,38 @@ pub const Layout = struct {
         }
         const line = self.lines_buf[li];
         const adv = advance(self.style, self.scale);
-        const rel = @max(0, point.x - self.alignOffset(line.width));
+        // rel 为相对本行文字起点的 x（已减去对齐偏移）。
+        const rel = point.x - self.alignOffset(line.width);
         var offset = line.start;
+        var edge: Edge = .leading;
+        var cluster_start = line.start;
         var x: f32 = 0;
-        while (offset < line.end) {
-            const next = nextGrapheme(self.text, offset);
-            const w = adv * @as(f32, @floatFromInt(core.codepointCount(self.text[offset..next])));
-            if (point.x < rel + x + w * 0.5) break;
-            x += w;
+        var cur = line.start;
+        while (cur < line.end) {
+            const next: u32 = @intCast(nextGrapheme(self.text, cur));
+            const w = adv * @as(f32, @floatFromInt(core.codepointCount(self.text[cur..next])));
+            cluster_start = cur;
+            // 前半取起始边界（leading）；中点及之后取末尾边界（trailing）。
+            if (rel < x + w * 0.5) {
+                offset = cur;
+                edge = .leading;
+                break;
+            }
             offset = next;
+            edge = .trailing;
+            if (rel < x + w) break;
+            x += w;
+            cur = next;
+        }
+        // 软换行处：行末 trailing 边界得 upstream。
+        var affinity: Affinity = .downstream;
+        if (edge == .trailing and offset == line.end and li + 1 < self.lines_buf.len and self.lines_buf[li + 1].start == offset) {
+            affinity = .upstream;
         }
         return .{
-            .caret = .{ .offset = @min(offset, self.text_len) },
-            .cluster_start = offset,
-            .edge = .leading,
+            .caret = .{ .offset = @min(offset, self.text_len), .affinity = affinity },
+            .cluster_start = cluster_start,
+            .edge = edge,
             .line = li,
             .inside = point.x >= 0 and point.y >= 0 and point.x <= self.size.w and point.y <= self.size.h,
         };
@@ -233,6 +416,8 @@ pub const Layout = struct {
     }
 
     fn alignOffset(self: *const Layout, line_w: f32) f32 {
+        // REQ-TEXT-017：max_width 为空时 x_offset = 0。
+        if (self.opts.max_width == null) return 0;
         return switch (self.opts.@"align") {
             .left => 0,
             .center => @floor((self.size.w - line_w) * 0.5),
@@ -248,15 +433,42 @@ pub const OwnedLayout = struct {
     }
 };
 
-/// 返回的 *const Layout 在下次调用前有效；供直接测量使用。
+/// 返回缓存中的排版结果（REQ-TEXT-013）。指针自获取起至下下次构建完成前有效（REQ-TEXT-014）。
 pub fn layout(text: []const u8, style: Style, scale: f32, opts: LayoutOptions) *const Layout {
-    const slot = layout_cache_idx % layout_cache.len;
-    if (layout_cache[slot]) |old| old.deinit();
-    const alloc = backend_allocator orelse std.heap.smp_allocator;
-    const owned = layoutOwned(alloc, text, style, scale, opts) catch unreachable;
-    layout_cache[slot] = owned.layout;
-    layout_cache_idx += 1;
-    return layout_cache[slot].?;
+    const key = CacheKey.make(style, scale, opts);
+    const h = key.hash(text);
+    var cur = cache_map.get(h);
+    while (cur) |e| : (cur = e.chain) {
+        if (e.key.eql(key) and std.mem.eql(u8, e.src_text, text)) {
+            e.last_gen = cache_gen;
+            lruUnlink(e);
+            lruPushFront(e);
+            core.stats.counter("cache.text_layout.hits").* += 1;
+            return e.layout;
+        }
+    }
+    core.stats.counter("cache.text_layout.misses").* += 1;
+    const alloc = requireInit(@src());
+    const owned = layoutOwned(alloc, text, style, scale, opts) catch outOfMemory();
+    const entry = alloc.create(CacheEntry) catch outOfMemory();
+    const copy = alloc.dupe(u8, text) catch outOfMemory();
+    const l = owned.layout;
+    entry.* = .{
+        .key = key,
+        .hash = h,
+        .src_text = copy,
+        .layout = l,
+        .bytes = @sizeOf(CacheEntry) + @sizeOf(Layout) + copy.len + l.text.len + l.lines_buf.len * @sizeOf(Line),
+        .last_gen = cache_gen,
+    };
+    const gop = cache_map.getOrPut(alloc, h) catch outOfMemory();
+    entry.chain = if (gop.found_existing) gop.value_ptr.* else null;
+    gop.value_ptr.* = entry;
+    lruPushFront(entry);
+    cache_entries += 1;
+    cache_bytes += entry.bytes;
+    cacheReport();
+    return l;
 }
 
 pub fn layoutOwned(allocator: std.mem.Allocator, text_in: []const u8, style: Style, scale: f32, opts: LayoutOptions) error{OutOfMemory}!OwnedLayout {
@@ -344,7 +556,7 @@ pub fn layoutOwned(allocator: std.mem.Allocator, text_in: []const u8, style: Sty
 pub fn measure(text: []const u8, style: Style, scale: f32, opts: LayoutOptions) core.Size {
     var effective = opts;
     effective.max_width = null;
-    const l = layoutOwned(std.heap.smp_allocator, text, style, scale, effective) catch return .{};
+    const l = layoutOwned(requireInit(@src()), text, style, scale, effective) catch return .{};
     defer l.layout.deinit();
     return l.layout.size;
 }
@@ -499,33 +711,33 @@ pub fn drawComposition(canvas: *gfx.Canvas, l: *const Layout, origin: core.Vec2,
     _ = canvas;
 }
 
-pub fn init(allocator: std.mem.Allocator, _: Config) error{OutOfMemory}!void {
+pub fn init(allocator: std.mem.Allocator, config: Config) error{OutOfMemory}!void {
+    cacheClear(); // 重新初始化时丢弃旧缓存
     backend_allocator = allocator;
+    cache_max_entries = config.layout_cache_entries;
+    cache_max_bytes = config.layout_cache_bytes;
     if (builtin.os.tag == .windows) {
         _ = @import("text/directwrite.zig").ensureFactory();
     }
 }
 pub fn deinit() void {
-    for (&layout_cache) |*slot| {
-        if (slot.*) |l| {
-            l.deinit();
-            slot.* = null;
-        }
-    }
-    layout_cache_idx = 0;
+    cacheClear();
     backend_allocator = null;
 }
 pub fn beginBuild() void {
-    const S = struct {
-        var ready: bool = false;
-    };
-    if (!S.ready) {
-        S.ready = true;
-        if (backend_allocator == null) init(std.heap.smp_allocator, .{}) catch {};
-    }
+    // 新的构建代；构建期间不淘汰，收敛由 trimCache 在构建完成后执行（REQ-TEXT-014）。
+    cache_gen += 1;
+    std.debug.assert(backend_allocator != null); // 必须先 text.init（REQ-ARCH-011）
 }
-pub fn onSettingsChanged() void {}
-pub fn trimCache() void {}
+pub fn onSettingsChanged() void {
+    // DPI、字体设置、主题字体令牌变化时整体清空（REQ-TEXT-013）。
+    cacheClear();
+}
+/// 每次构建完成后调用：按 REQ-TEXT-014 淘汰超限且未受保护的条目。
+pub fn trimCache() void {
+    cacheEvict();
+    cacheReport();
+}
 
 pub const Config = struct {
     layout_cache_entries: u32 = 4096,

@@ -70,13 +70,8 @@ pub const dialogs = struct {
     }
 };
 
-pub const ButtonRole = enum { normal, default, cancel, default_and_cancel };
-pub const DialogButton = struct {
-    label: []const u8,
-    code: u32,
-    role: ButtonRole = .normal,
-    enabled: bool = true,
-};
+pub const ButtonRole = widgets.ButtonRole;
+pub const DialogButton = widgets.DialogButton;
 
 pub const Options = struct {
     title: []const u8 = "nano_gui",

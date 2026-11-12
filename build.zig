@@ -185,7 +185,16 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/bench.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "nano_gui", .module = mod }},
+            .imports = &.{
+                .{ .name = "nano_gui", .module = mod },
+                // 参考界面 G 的候选实现（示例“控件总览”），用于核对测量对象的节点数（REQ-PERF-003）。
+                .{ .name = "gallery", .module = b.createModule(.{
+                    .root_source_file = b.path("examples/gallery.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "nano_gui", .module = mod }},
+                }) },
+            },
         }),
     });
     const run_bench = b.addRunArtifact(bench);
@@ -203,6 +212,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_check = b.addRunArtifact(check_docs);
+    run_check.setCwd(b.path("."));
     const docs_step = b.step("check-docs", "运行文档一致性检查");
     docs_step.dependOn(&run_check.step);
 

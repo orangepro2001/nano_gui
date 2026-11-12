@@ -91,7 +91,7 @@ pub const Registry = struct {
 
 pub const Chord = input.Chord;
 
-test "AC-APP command registry" {
+test "command registry smoke: lookup, invoke, disable (no AC yet)" {
     var reg = Registry.init(std.testing.allocator);
     defer reg.deinit();
     const S = struct {
