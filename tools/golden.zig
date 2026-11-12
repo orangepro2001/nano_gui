@@ -30,6 +30,7 @@ var checked: bool = true;
 
 pub fn main(init: std.process.Init) !void {
     nano.platform.forceHeadless();
+    nano.text.setDirectWrite(false);
     const gpa = init.gpa;
     const io = init.io;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);

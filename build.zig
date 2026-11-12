@@ -4,7 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const text_backend = b.option([]const u8, "text-backend", "文字后端：directwrite/fontstash/fixed") orelse "fixed";
+    const text_backend = b.option([]const u8, "text-backend", "文字后端：directwrite/fontstash/fixed") orelse
+        (if (target.result.os.tag == .windows) "directwrite" else "fixed");
     const force_rebuild = b.option(bool, "force-rebuild", "每帧强制构建脏") orelse false;
     const show_damage = b.option(bool, "show-damage", "标出损伤矩形") orelse false;
 
