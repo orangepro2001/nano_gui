@@ -105,7 +105,7 @@ const IDWriteBitmapRenderTarget = extern struct {
         DrawGlyphRun: *const fn (*anyopaque, f32, f32, u32, *const GlyphRun, ?*anyopaque, u32, ?*Rect) callconv(.winapi) i32,
         GetMemoryDC: *const fn (*anyopaque) callconv(.winapi) ?*anyopaque,
         GetPixelsPerDip: *const fn (*anyopaque) callconv(.winapi) f32,
-        SetPixelsPerDip: *const fn () callconv(.winapi) void,
+        SetPixelsPerDip: *const fn (*anyopaque, f32) callconv(.winapi) void,
         GetCurrentTransform: *const fn () callconv(.winapi) void,
         SetCurrentTransform: *const fn () callconv(.winapi) void,
         GetSize: *const fn (*anyopaque, *Rect) callconv(.winapi) i32,
