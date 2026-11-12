@@ -117,6 +117,7 @@ pub const App = struct {
         try platform.init(gpa);
         gfx.init(gpa);
         try text.init(gpa, .{});
+        text.setDirectWrite(std.mem.eql(u8, build_options.text_backend, "directwrite"));
         core.stats.initRegistry();
         const w = try platform.createWindow(.{
             .title = opts.title,

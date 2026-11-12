@@ -14,6 +14,10 @@ var backend_allocator: ?std.mem.Allocator = null;
 var use_directwrite: bool = false;
 
 pub fn setDirectWrite(enabled: bool) void {
+    if (comptime builtin.os.tag != .windows) {
+        use_directwrite = false;
+        return;
+    }
     use_directwrite = enabled;
     if (enabled) _ = directwrite.ensureFactory();
 }

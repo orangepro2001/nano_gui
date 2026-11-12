@@ -102,6 +102,9 @@ jobs:
       - name: Unit tests (Win32 backend)
         run: zig build test
 
+      - name: Unit tests (DirectWrite text backend)
+        run: zig build -Dtext-backend=directwrite test
+
       - name: Golden tests (Win32 + software surface)
         run: zig build test-golden
 
