@@ -82,6 +82,18 @@ const GlyphRunDescription = extern struct {
 };
 const Rect = extern struct { left: i32 = 0, top: i32 = 0, right: i32 = 0, bottom: i32 = 0 };
 
+const Matrix = extern struct { m11: f32 = 1, m12: f32 = 0, m21: f32 = 0, m22: f32 = 1, dx: f32 = 0, dy: f32 = 0 };
+const GlyphRunAnalysis = extern struct {
+    vtbl: *const Vtbl,
+    const Vtbl = extern struct {
+        QueryInterface: *const fn () callconv(.winapi) void,
+        AddRef: *const fn () callconv(.winapi) void,
+        Release: *const fn (*anyopaque) callconv(.winapi) u32,
+        GetAlphaTextureBounds: *const fn (*anyopaque, u32, *Rect) callconv(.winapi) i32,
+        CreateAlphaTexture: *const fn (*anyopaque, u32, *const Rect, [*]u8, u32) callconv(.winapi) i32,
+    };
+};
+
 const IDWriteGdiInterop = extern struct {
     vtbl: *const Vtbl,
     const Vtbl = extern struct {
@@ -115,9 +127,11 @@ const IDWriteBitmapRenderTarget = extern struct {
 
 const TextRenderer = extern struct {
     vtbl: *const Vtbl,
-    target: *IDWriteBitmapRenderTarget,
-    color: u32 = 0xFFFFFF,
-    rparams: ?*anyopaque = null,
+    factory: *IDWriteFactory,
+    canvas: *gfx.Canvas,
+    origin_x: f32,
+    origin_y: f32,
+    color: [4]u8,
     const Vtbl = extern struct {
         QueryInterface: *const fn (*anyopaque, *const winapi.GUID, *?*anyopaque) callconv(.winapi) i32,
         AddRef: *const fn (*anyopaque) callconv(.winapi) u32,
@@ -144,6 +158,11 @@ const IDWriteFactory = extern struct {
         CreateTypography: *const fn () callconv(.winapi) void,
         GetGdiInterop: *const fn (*anyopaque, *?*IDWriteGdiInterop) callconv(.winapi) i32,
         CreateTextLayout: *const fn (*anyopaque, [*]const u16, u32, *IDWriteTextFormat, f32, f32, *?*IDWriteTextLayout) callconv(.winapi) i32,
+        CreateGdiCompatibleTextLayout: *const fn () callconv(.winapi) void,
+        CreateEllipsisTrimmingSign: *const fn () callconv(.winapi) void,
+        CreateTextAnalyzer: *const fn () callconv(.winapi) void,
+        CreateNumberSubstitution: *const fn () callconv(.winapi) void,
+        CreateGlyphRunAnalysis: *const fn (*anyopaque, *const GlyphRun, f32, *const Matrix, u32, u32, f32, f32, *?*GlyphRunAnalysis) callconv(.winapi) i32,
     };
 };
 
@@ -217,8 +236,30 @@ fn cbPixels(_: *anyopaque, _: ?*anyopaque, ppd: *f32) callconv(.winapi) i32 {
 }
 fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: *const GlyphRun, _: *const GlyphRunDescription, _: ?*anyopaque) callconv(.winapi) i32 {
     const r: *TextRenderer = @ptrCast(@alignCast(this));
-    const hr = r.target.vtbl.DrawGlyphRun(r.target, x, y, mode, run, r.rparams, r.color, null);
-    return hr;
+    var m = Matrix{};
+    var analysis: ?*GlyphRunAnalysis = null;
+    if (r.factory.vtbl.CreateGlyphRunAnalysis(r.factory, run, 1.0, &m, mode, 0, 0, 0, &analysis) < 0 or analysis == null) return 0;
+    defer _ = analysis.?.vtbl.Release(analysis.?);
+    var bounds = Rect{};
+    if (analysis.?.vtbl.GetAlphaTextureBounds(analysis.?, 0, &bounds) < 0) return 0;
+    const bw: i32 = bounds.right - bounds.left;
+    const bh: i32 = bounds.bottom - bounds.top;
+    if (bw <= 0 or bh <= 0) return 0;
+    const n: usize = @intCast(bw * bh);
+    const alpha = std.heap.smp_allocator.alloc(u8, n) catch return 0;
+    defer std.heap.smp_allocator.free(alpha);
+    if (analysis.?.vtbl.CreateAlphaTexture(analysis.?, 0, &bounds, alpha.ptr, @intCast(n)) < 0) return 0;
+    var yy: i32 = 0;
+    while (yy < bh) : (yy += 1) {
+        var xx: i32 = 0;
+        while (xx < bw) : (xx += 1) {
+            const a = alpha[@intCast(yy * bw + xx)];
+            if (a == 0) continue;
+            const c = core.Color{ .r = r.color[0], .g = r.color[1], .b = r.color[2], .a = a };
+            r.canvas.blitPixel(r.origin_x + x + @as(f32, @floatFromInt(bounds.left + xx)), r.origin_y + y + @as(f32, @floatFromInt(bounds.top + yy)), c);
+        }
+    }
+    return 0;
 }
 fn cbUnderline() callconv(.winapi) void {}
 fn cbStrike() callconv(.winapi) void {}
@@ -280,51 +321,6 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     var layout: ?*IDWriteTextLayout = null;
     if (f.vtbl.CreateTextLayout(f, wide.ptr, @intCast(wide.len), fmt.?, 1.0e7, 1.0e7, &layout) < 0 or layout == null) return error.DirectWriteFailed;
     defer _ = layout.?.vtbl.Release(layout.?);
-    var metrics: TextMetrics = .{};
-    if (layout.?.vtbl.GetMetrics(layout.?, &metrics) < 0) return error.DirectWriteFailed;
-    const w: u32 = @intFromFloat(@max(1, @ceil(metrics.width) + 4));
-    const h: u32 = @intFromFloat(@max(1, @ceil(metrics.height) + 4));
-    var gdi: ?*IDWriteGdiInterop = null;
-    if (f.vtbl.GetGdiInterop(f, &gdi) < 0 or gdi == null) return error.DirectWriteFailed;
-    defer _ = gdi.?.vtbl.Release(gdi.?);
-    const screen_dc = GetDC(null) orelse return error.DirectWriteFailed;
-    defer _ = ReleaseDC(null, screen_dc);
-    var target: ?*IDWriteBitmapRenderTarget = null;
-    if (gdi.?.vtbl.CreateBitmapRenderTarget(gdi.?, screen_dc, w, h, &target) < 0 or target == null) return error.DirectWriteFailed;
-    target.?.vtbl.SetPixelsPerDip(target.?, 1.0);
-    defer _ = target.?.vtbl.Release(target.?);
-    var rparams: ?*anyopaque = null;
-    const create_rp = @as(*const fn (*anyopaque, *?*anyopaque) callconv(.winapi) i32, @ptrCast(f.vtbl.pre_text_format[6]));
-    _ = create_rp(f, &rparams);
-    const text_color: u32 = @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16);
-    var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color, .rparams = rparams };
-    renderer.target = target.?;
-    if (layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0) < 0) return error.DirectWriteFailed;
-    const memdc = target.?.vtbl.GetMemoryDC(target.?) orelse return error.DirectWriteFailed;
-    var bmi = BitmapInfo{};
-    bmi.bmiHeader.biWidth = @intCast(w);
-    bmi.bmiHeader.biHeight = -@as(i32, @intCast(h));
-    const dst_dc = CreateCompatibleDC(null) orelse return error.DirectWriteFailed;
-    defer _ = DeleteDC(dst_dc);
-    var raw_bits: ?*anyopaque = null;
-    const dib = CreateDIBSection(dst_dc, &bmi, 0, &raw_bits, null, 0) orelse return error.DirectWriteFailed;
-    defer _ = DeleteObject(dib);
-    const old = SelectObject(dst_dc, dib);
-    defer _ = SelectObject(dst_dc, old);
-    _ = GdiFlush();
-    _ = BitBlt(dst_dc, 0, 0, @intCast(w), @intCast(h), memdc, 0, 0, 0x00CC0020);
-    const bits = @as([*]u8, @ptrCast(raw_bits orelse return error.DirectWriteFailed))[0 .. @as(usize, w) * h * 4];
-    // target 为 BGRA；按 alpha 混合到 Canvas 的 RGBA。
-    var y: u32 = 0;
-    while (y < h) : (y += 1) {
-        var x: u32 = 0;
-        while (x < w) : (x += 1) {
-            const o = (@as(usize, y) * w + x) * 4;
-            const rgb_nonzero = bits[o] != 0 or bits[o + 1] != 0 or bits[o + 2] != 0;
-            if (!rgb_nonzero) continue;
-            const a = if (bits[o + 3] == 0) 255 else bits[o + 3];
-            const px = core.Color{ .r = bits[o + 2], .g = bits[o + 1], .b = bits[o], .a = a };
-            canvas.blitPixel(origin.x + @as(f32, @floatFromInt(x)), origin.y + @as(f32, @floatFromInt(y)), px);
-        }
-    }
+    var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .factory = f, .canvas = canvas, .origin_x = origin.x, .origin_y = origin.y, .color = .{ color.r, color.g, color.b, color.a } };
+    if (layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 0, 0) < 0) return error.DirectWriteFailed;
 }
