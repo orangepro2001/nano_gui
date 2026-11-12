@@ -237,6 +237,8 @@ const renderer_vtbl = TextRenderer.Vtbl{
     .DrawInlineObject = cbInline,
 };
 
+extern "user32" fn GetDC(hwnd: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn ReleaseDC(hwnd: ?*anyopaque, dc: ?*anyopaque) callconv(.winapi) i32;
 extern "gdi32" fn CreateCompatibleDC(hdc: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteDC(hdc: ?*anyopaque) callconv(.winapi) i32;
 extern "gdi32" fn GetCurrentObject(hdc: ?*anyopaque, ty: u32) callconv(.winapi) ?*anyopaque;
@@ -285,10 +287,11 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     var gdi: ?*IDWriteGdiInterop = null;
     if (f.vtbl.GetGdiInterop(f, &gdi) < 0 or gdi == null) return error.DirectWriteFailed;
     defer _ = gdi.?.vtbl.Release(gdi.?);
-    const dc = CreateCompatibleDC(null) orelse return error.DirectWriteFailed;
-    defer _ = DeleteDC(dc);
+    const screen_dc = GetDC(null) orelse return error.DirectWriteFailed;
+    defer _ = ReleaseDC(null, screen_dc);
     var target: ?*IDWriteBitmapRenderTarget = null;
-    if (gdi.?.vtbl.CreateBitmapRenderTarget(gdi.?, dc, w, h, &target) < 0 or target == null) return error.DirectWriteFailed;
+    if (gdi.?.vtbl.CreateBitmapRenderTarget(gdi.?, screen_dc, w, h, &target) < 0 or target == null) return error.DirectWriteFailed;
+    target.?.vtbl.SetPixelsPerDip(target.?, 1.0);
     defer _ = target.?.vtbl.Release(target.?);
     var rparams: ?*anyopaque = null;
     const create_rp = @as(*const fn (*anyopaque, *?*anyopaque) callconv(.winapi) i32, @ptrCast(f.vtbl.pre_text_format[6]));
