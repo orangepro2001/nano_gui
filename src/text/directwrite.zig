@@ -238,7 +238,7 @@ fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: 
     const r: *TextRenderer = @ptrCast(@alignCast(this));
     _ = mode;
     var analysis: ?*GlyphRunAnalysis = null;
-    const gh = r.factory.vtbl.CreateGlyphRunAnalysis(r.factory, run, 1.0, null, 4, 0, 0, 0, &analysis);
+    const gh = r.factory.vtbl.CreateGlyphRunAnalysis(r.factory, run, 1.0, null, 1, 0, 0, 0, &analysis);
     std.debug.print("dw analysis hr=0x{x} ptr={}\n", .{ @as(u32, @bitCast(gh)), analysis != null });
     if (gh < 0 or analysis == null) return 0;
     defer _ = analysis.?.vtbl.Release(analysis.?);
