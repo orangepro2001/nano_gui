@@ -238,17 +238,23 @@ fn cbGlyphRun(this: *anyopaque, _: ?*anyopaque, x: f32, y: f32, mode: u32, run: 
     const r: *TextRenderer = @ptrCast(@alignCast(this));
     var m = Matrix{};
     var analysis: ?*GlyphRunAnalysis = null;
-    if (r.factory.vtbl.CreateGlyphRunAnalysis(r.factory, run, 1.0, &m, mode, 0, 0, 0, &analysis) < 0 or analysis == null) return 0;
+    const gh = r.factory.vtbl.CreateGlyphRunAnalysis(r.factory, run, 1.0, &m, mode, 0, 0, 0, &analysis);
+    std.debug.print("dw analysis hr=0x{x} ptr={}\n", .{ @as(u32, @bitCast(gh)), analysis != null });
+    if (gh < 0 or analysis == null) return 0;
     defer _ = analysis.?.vtbl.Release(analysis.?);
     var bounds = Rect{};
-    if (analysis.?.vtbl.GetAlphaTextureBounds(analysis.?, 0, &bounds) < 0) return 0;
+    const bh0 = analysis.?.vtbl.GetAlphaTextureBounds(analysis.?, 0, &bounds);
+    std.debug.print("dw bounds hr=0x{x} {d},{d},{d},{d}\n", .{ @as(u32, @bitCast(bh0)), bounds.left, bounds.top, bounds.right, bounds.bottom });
+    if (bh0 < 0) return 0;
     const bw: i32 = bounds.right - bounds.left;
     const bh: i32 = bounds.bottom - bounds.top;
     if (bw <= 0 or bh <= 0) return 0;
     const n: usize = @intCast(bw * bh);
     const alpha = std.heap.smp_allocator.alloc(u8, n) catch return 0;
     defer std.heap.smp_allocator.free(alpha);
-    if (analysis.?.vtbl.CreateAlphaTexture(analysis.?, 0, &bounds, alpha.ptr, @intCast(n)) < 0) return 0;
+    const th = analysis.?.vtbl.CreateAlphaTexture(analysis.?, 0, &bounds, alpha.ptr, @intCast(n));
+    std.debug.print("dw texture hr=0x{x} n={d}\n", .{ @as(u32, @bitCast(th)), n });
+    if (th < 0) return 0;
     var yy: i32 = 0;
     while (yy < bh) : (yy += 1) {
         var xx: i32 = 0;
