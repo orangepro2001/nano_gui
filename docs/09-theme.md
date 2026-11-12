@@ -133,7 +133,14 @@
 
 `text_disabled`、`border_control_disabled`、`border_subtle`、`border_strong` 不受对比度要求约束（禁用内容与装饰性分隔）。
 
-**REQ-THEME-009**　强调色族**必须**默认从系统强调色派生（Win32：`DwmGetColorizationColor` 或 `UISettings` 等价值；应用可指定固定强调色覆盖）。派生算法：
+**REQ-THEME-009**　强调色族**必须**默认从系统强调色派生（Win32：`DwmGetColorizationColor` 或 `UISettings` 等价值；应用可指定固定强调色覆盖）。
+
+**默认强调色**指 `#2F6EDF`（即 REQ-THEME-007 表中浅色 `accent_fill_top` 的值，03 的 GLFW 外观默认值引用的就是它）；**默认强调色族**指 REQ-THEME-007 表中全部 `accent_*` 令牌在对应深浅模式下的值。表中的默认强调色族是规范性的定值，**不是**对默认强调色执行下列算法的结果，实现**不得**用派生结果替换它。下列任一情况下，强调色族**必须**直接取默认强调色族，不执行派生：
+- 平台未提供系统强调色，或读取失败；
+- 系统强调色（丢弃 alpha）与默认强调色逐分量相等，且应用未指定固定强调色；
+- 下列第 1 步判定为接近灰色。
+
+其余情况按以下算法派生：
 
 1. 取系统色的色相 H 与饱和度 S（HSL）。若 S < 0.15（接近灰色），改用默认强调色族。
 2. 保持 H，S 夹紧到 [0.55, 0.85]。
@@ -383,6 +390,8 @@ pub const Theme = struct {
     durations_ms: std.EnumArray(Duration, u16),
 
     pub fn default(mode: Mode, sys: platform.SystemAppearance) Theme;
+    /// 应用指定固定强调色时用此入口；`fixed_accent = null` 等同 `default`（REQ-THEME-009）。
+    pub fn defaultWithAccent(mode: Mode, sys: platform.SystemAppearance, fixed_accent: ?Color) Theme;
     pub fn color(self: *const Theme, t: ColorToken) Color;
     pub fn metric(self: *const Theme, m: Metric) f32;
     pub fn px(self: *const Theme, m: Metric, scale: f32) i32;      // REQ-THEME-013
@@ -459,9 +468,9 @@ pub fn drawRowFocus(ctx: *const DrawCtx, r: Rect, on_selection: bool) void;
 
 **AC-THEME-004**　`[金图]` 覆盖：REQ-THEME-005、REQ-THEME-030。渲染每种基础控件的 常态/悬停/按下/聚焦/禁用/选中 矩阵。预期：与基准图一致；禁用态像素中不存在由半透明混合产生的颜色（禁用态用到的颜色集合 ⊆ 禁用令牌 ∪ 表面令牌）；按下态内容相对常态下移恰 1 ppx。
 
-**AC-THEME-005**　`[单元]` 覆盖：REQ-THEME-007、REQ-THEME-008。对默认浅色与深色主题调用 `theme.validate`；并断言 `ColorToken` 的每个成员在两套主题中的值与本文表格一致（测试数据由文档表格生成）。预期：校验通过，零不达标项；值全部相符。另构造一个把 `text_primary` 改为与 `surface_window` 相同的主题，预期 `validate` 返回假并指出该对。
+**AC-THEME-005**　`[单元]` 覆盖：REQ-THEME-007、REQ-THEME-008。对默认浅色与深色主题（系统强调色等于默认强调色，即 REQ-THEME-009 的取表值情形）调用 `theme.validate`；并断言 `ColorToken` 的每个成员在两套主题中的值与本文表格一致（测试数据由文档表格生成）。预期：校验通过，零不达标项；值全部相符。另构造一个把 `text_primary` 改为与 `surface_window` 相同的主题，预期 `validate` 返回假并指出该对。
 
-**AC-THEME-006**　`[单元]` 覆盖：REQ-THEME-009。以 24 个色相均匀分布的高饱和色、3 个灰色、纯黑、纯白作为系统强调色调用 `deriveAccent`（浅/深各一次）。预期：每个结果均通过 `validate`；灰色、黑、白输入得到默认强调色族；非灰输入的结果色相与输入色相之差 ≤ 2°。
+**AC-THEME-006**　`[单元]` 覆盖：REQ-THEME-009。以 24 个色相均匀分布的高饱和色、3 个灰色、纯黑、纯白作为系统强调色调用 `deriveAccent`（浅/深各一次）。预期：每个结果均通过 `validate`；灰色、黑、白输入以及默认强调色 `#2F6EDF` 输入，得到的强调色族与 REQ-THEME-007 表中的值逐项相等（默认强调色族）；非灰输入的结果色相与输入色相之差 ≤ 2°。
 
 **AC-THEME-007**　`[人工]` 覆盖：REQ-THEME-010、REQ-THEME-036。应用运行中，在系统设置里依次切换：应用深浅色、强调色、高对比度开/关、文本大小（辅助功能）、动画开关；并把窗口拖到不同缩放的显示器。预期：每次变化后 1 秒内界面完成更新，标题栏深浅同步，无残留的旧颜色或旧尺寸，无需重启。
 

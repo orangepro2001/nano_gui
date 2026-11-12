@@ -184,7 +184,7 @@
 | S-CARET | G，聚焦一个文本框，系统光标闪烁周期 500 ms | 回放脚本：每次 `advance 500` | REQ-PERF-018 |
 | S-INPUT | G | 回放脚本：每帧一次 `down left` 与 `up left` | REQ-PERF-019 |
 | S-VLIST-100K | 虚拟列表 10 万行，视口固定 | 回放脚本：每帧 `wheel -1`（向下滚动一格） | REQ-PERF-020，REQ-PERF-035 |
-| S-VLIST-SCALE | 同 S-VLIST-100K，总行数分别为 1 万、10 万、100 万 | 回放脚本：同 S-VLIST-100K | REQ-PERF-021，REQ-PERF-035 |
+| S-VLIST-SCALE | 同 S-VLIST-100K，总行数分别为 1 万、10 万、100 万 | 回放脚本：同 S-VLIST-100K | REQ-PERF-021，REQ-PERF-035，REQ-PERF-036（取 1 万与 100 万两档的 `time.build` P99 之比，见 AC-PERF-033） |
 | S-TABLE-1M | 表格 100 万行 × 20 列 | 回放脚本：每帧 `wheel -1`（向下滚动一格） | REQ-PERF-022 |
 | S-TEXT-KEY | 文本编辑区，10 MB、20 万行，已聚焦 | 回放脚本：每帧一次 `key down` 与 `key up` 字符键 | REQ-PERF-023 |
 | S-TEXT-LOAD | 文本编辑区，10 MB、20 万行 | 基准驱动器 API 调用：从冷状态载入 10 次 | REQ-PERF-024 |

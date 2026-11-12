@@ -25,7 +25,7 @@
 
 ### 3.1 总则
 
-**REQ-TEXT-001**　`text` 的公共接口**必须**与后端无关，由编译期选择的后端实现（REQ-ARCH-004）：`directwrite`（Win32 默认）、`fontstash`（GLFW 默认）、`fixed`（固定度量测试后端，仅 `-Dtext-backend=fixed` 选择，供 `zig build test` 的布局与控件逻辑测试使用）。三个后端**必须**通过同一套接口一致性测试（度量数值按后端分别断言）。DirectWrite 与 COM 符号**只能**出现在 `text/directwrite/` 下（REQ-ARCH-003）。
+**REQ-TEXT-001**　`text` 的公共接口**必须**与后端无关，由编译期选择的后端实现（REQ-ARCH-004）：`directwrite`（Win32 默认）、`fontstash`（GLFW 默认）、`fixed`（固定度量测试后端，仅 `-Dtext-backend=fixed` 选择，供 `zig build test` 的布局与控件逻辑测试使用）。三个后端**必须**通过同一套接口一致性测试（度量数值按后端分别断言）。DirectWrite 与 COM 符号**只能**出现在 DirectWrite 后端的实现文件中，即 `src/text/directwrite.zig` 或 `src/text/directwrite/` 目录下（REQ-ARCH-003、REQ-ARCH-006）。
 
 **REQ-TEXT-002**　全部文本位置（偏移）**必须**是调用方所传 UTF-8 字节串中的字节偏移，且**必须**落在字素簇边界上（0 与 `len` 视为边界）。接收偏移的函数收到非边界偏移时，调试构建断言中止，发布构建向下对齐到不大于该值的最近边界。返回偏移的函数**必须**只返回边界值。
 
@@ -351,7 +351,7 @@ pub const testing = struct {
 
 除标 `[人工]` 者外，以下测试在 `fixed` 后端（单元）或 GLFW 无头模式（金图）下运行。涉及 DirectWrite 的条款必须在真实 Windows 上执行。`fixed` 后端的度量：`scale = 1.0`、`size = 12` 时每簇前进 6 ppx，`ascent = 12`、`descent = 3`、行高 15。
 
-**AC-TEXT-001**　`[单元]` 覆盖：REQ-TEXT-001。同一份接口一致性测试（`tests/text_conformance.zig`）分别以 `fixed`、`fontstash` 编译运行，Windows 上加 `directwrite`；测试仅断言结构性不变量（REQ-TEXT-012 的不变量、偏移合法性、缓存命中）与按后端分列的度量常量。预期：各后端全部通过。导入检查脚本断言 DirectWrite/COM 符号只出现在 `src/text/directwrite/`；`-Dtext-backend=fixed` 之外的构建不含 `fixed` 后端符号。
+**AC-TEXT-001**　`[单元]` 覆盖：REQ-TEXT-001。同一份接口一致性测试（`tests/text_conformance.zig`）分别以 `fixed`、`fontstash` 编译运行，Windows 上加 `directwrite`；测试仅断言结构性不变量（REQ-TEXT-012 的不变量、偏移合法性、缓存命中）与按后端分列的度量常量。预期：各后端全部通过。导入检查脚本断言 DirectWrite/COM 符号只出现在 `src/text/directwrite.zig` 或 `src/text/directwrite/` 下；`-Dtext-backend=fixed` 之外的构建不含 `fixed` 后端符号。
 
 **AC-TEXT-002**　`[单元]` 覆盖：REQ-TEXT-002、REQ-TEXT-021。(1) 以 Unicode 官方 `GraphemeBreakTest.txt`（版本与 `unicode_version.zig` 一致）全部用例逐条断言 `isGraphemeBoundary`、`nextGrapheme`、`prevGrapheme`。预期：通过率 100%。(2) 手工向量：`"e\u{0301}"` → 边界 `{0, 3}`；`"🇨🇳🇺🇸"` → `{0, 8, 16}`；`"👨‍👩‍👧"` → `{0, 18}`；`"\r\n"` → `{0, 2}`；`"你好"` → `{0, 3, 6}`；`"한"`（`U+1112 U+1161 U+11AB`）→ 一个簇。(3) 将非边界偏移（如 `"e\u{0301}"` 的 1）传给 `caretRect`、`selectionRects`：调试构建断言中止；发布构建结果与偏移 0 相同；`hitTest` 对任意点返回的偏移全部属于边界集合（1000 个随机点）。
 
