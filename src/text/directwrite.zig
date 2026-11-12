@@ -299,9 +299,7 @@ pub fn draw(allocator: std.mem.Allocator, canvas: *gfx.Canvas, text: []const u8,
     const text_color: u32 = @as(u32, color.r) | (@as(u32, color.g) << 8) | (@as(u32, color.b) << 16);
     var renderer = TextRenderer{ .vtbl = &renderer_vtbl, .target = target.?, .color = text_color, .rparams = rparams };
     renderer.target = target.?;
-    const draw_hr = layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0);
-    std.debug.print("dwrite layout draw hr=0x{x}\n", .{@as(u32, @bitCast(draw_hr))});
-    if (draw_hr < 0) return error.DirectWriteFailed;
+    if (layout.?.vtbl.Draw(layout.?, null, @ptrCast(&renderer), 2.0, 2.0) < 0) return error.DirectWriteFailed;
     const memdc = target.?.vtbl.GetMemoryDC(target.?) orelse return error.DirectWriteFailed;
     var bmi = BitmapInfo{};
     bmi.bmiHeader.biWidth = @intCast(w);
