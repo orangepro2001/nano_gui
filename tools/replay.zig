@@ -49,7 +49,6 @@ fn fail(file: []const u8, line: u32, comptime fmt: []const u8, args: anytype) no
 
 pub fn main(init: std.process.Init) !void {
     nano.platform.forceHeadless();
-    nano.text.setDirectWrite(false);
     const gpa = init.gpa;
     const io = init.io;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
@@ -67,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
 
     var m = Model{};
     var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 420, .h = 240 }, .title = "replay" });
+    nano.text.setDirectWrite(false);
     defer app.deinit();
     app.io = io;
     app.renderOnce(@as(*anyopaque, @ptrCast(&m)), build);

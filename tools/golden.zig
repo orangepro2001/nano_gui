@@ -30,7 +30,6 @@ var checked: bool = true;
 
 pub fn main(init: std.process.Init) !void {
     nano.platform.forceHeadless();
-    nano.text.setDirectWrite(false);
     const gpa = init.gpa;
     const io = init.io;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
@@ -47,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 240, .h = 140 }, .title = "golden" });
+    nano.text.setDirectWrite(false);
     defer app.deinit();
     app.io = io;
     app.renderOnce(@as(*anyopaque, @ptrCast(&checked)), scene);
