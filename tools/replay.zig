@@ -1152,6 +1152,14 @@ fn runScript(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !struct { pas
     app.renderOnce(@as(*anyopaque, @ptrCast(&r)), build);
     r.cur_line = 0;
     reportDups(&r);
+    // 无事件、模型不变时构建必须幂等（REQ-FRAME-024/025）。
+    const idem = app.ui_state.checkIdempotence(@as(*anyopaque, @ptrCast(&r)), build);
+    if (idem.differences > 0) {
+        std.debug.print("replay: {s} 幂等校验失败，差异 {d}，首个节点 {?s}（{s}:{d}）\n", .{ path, idem.differences, idem.first_name, idem.first_file, idem.first_line });
+        r.failed += 1;
+    }
+    // 校验会构建两次但不布局；恢复执行脚本前的树与画面。
+    app.renderOnce(@as(*anyopaque, @ptrCast(&r)), build);
 
     for (steps.items) |s| execStep(&r, s);
     return .{ .passed = r.passed, .failed = r.failed };

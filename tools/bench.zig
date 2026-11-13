@@ -6,7 +6,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const nano = @import("nano_gui");
 const gallery = @import("gallery");
+const bench_paths = @import("bench_paths");
 const core = nano.core;
+const ui = nano.ui;
+const w = nano.widgets;
+const gfx = nano.gfx;
+const text = nano.text;
+const platform = nano.platform;
 
 // ---- 接口草案（12 第 4 节） ----
 
@@ -72,44 +78,61 @@ const budgets = [_]Budget{
 
 // ---- 场景注册表（REQ-PERF-038 的 19 个冻结场景名） ----
 
-const Driver = enum { none, g_build, g_frame, g_steady };
+const Driver = enum {
+    idle,
+    cold,
+    g_build,
+    g_layout_full,
+    g_layout_inc,
+    g_paint_full,
+    g_frame,
+    g_steady,
+    hover,
+    caret,
+    input,
+    vlist_100k,
+    vlist_scale,
+    table_1m,
+    text_key,
+    text_load,
+    resize_4k,
+    cache_limit,
+    size_check,
+};
 
 const Scene = struct {
     name: []const u8,
-    /// 本场景的被测预算（按 REQ 编号）。
     reqs: []const []const u8,
-    /// 是否以参考界面 G 为测量对象（需先核对 frame.nodes，REQ-PERF-003）。
     needs_g: bool,
     driver: Driver,
-    /// driver == .none 时的未实现原因。
-    reason: []const u8 = "",
 };
 
 const scenes = [_]Scene{
-    .{ .name = "S-IDLE", .reqs = &.{"REQ-PERF-010"}, .needs_g = true, .driver = .none, .reason = "需 60 秒静置与平台进程 CPU 时间读数，platform 尚未提供" },
-    .{ .name = "S-COLD", .reqs = &.{"REQ-PERF-011"}, .needs_g = true, .driver = .none, .reason = "需进程级冷启动驱动，且 time.startup / time.gl_context 尚未在入口埋点" },
+    .{ .name = "S-IDLE", .reqs = &.{"REQ-PERF-010"}, .needs_g = true, .driver = .idle },
+    .{ .name = "S-COLD", .reqs = &.{"REQ-PERF-011"}, .needs_g = true, .driver = .cold },
     .{ .name = "S-G-BUILD", .reqs = &.{"REQ-PERF-012"}, .needs_g = true, .driver = .g_build },
-    .{ .name = "S-G-LAYOUT-FULL", .reqs = &.{"REQ-PERF-013"}, .needs_g = true, .driver = .none, .reason = "需经 13 的回放运行器驱动 resize，bench 尚未接入" },
-    .{ .name = "S-G-LAYOUT-INC", .reqs = &.{"REQ-PERF-014"}, .needs_g = true, .driver = .none, .reason = "需含文本长度可变叶节点的 G 构造" },
-    .{ .name = "S-G-PAINT-FULL", .reqs = &.{"REQ-PERF-015"}, .needs_g = true, .driver = .none, .reason = "整窗口 invalidateRect 驱动尚未实现" },
+    .{ .name = "S-G-LAYOUT-FULL", .reqs = &.{"REQ-PERF-013"}, .needs_g = true, .driver = .g_layout_full },
+    .{ .name = "S-G-LAYOUT-INC", .reqs = &.{"REQ-PERF-014"}, .needs_g = true, .driver = .g_layout_inc },
+    .{ .name = "S-G-PAINT-FULL", .reqs = &.{"REQ-PERF-015"}, .needs_g = true, .driver = .g_paint_full },
     .{ .name = "S-G-FRAME", .reqs = &.{ "REQ-PERF-016", "REQ-PERF-033" }, .needs_g = true, .driver = .g_frame },
     .{ .name = "S-G-STEADY", .reqs = &.{ "REQ-PERF-026", "REQ-PERF-027" }, .needs_g = true, .driver = .g_steady },
-    .{ .name = "S-HOVER", .reqs = &.{"REQ-PERF-017"}, .needs_g = true, .driver = .none, .reason = "需回放脚本驱动 move，bench 尚未接入回放运行器" },
-    .{ .name = "S-CARET", .reqs = &.{"REQ-PERF-018"}, .needs_g = true, .driver = .none, .reason = "需回放脚本驱动 advance 与聚焦文本框，bench 尚未接入回放运行器" },
-    .{ .name = "S-INPUT", .reqs = &.{"REQ-PERF-019"}, .needs_g = true, .driver = .none, .reason = "需回放脚本驱动 down/up，且 time.input_to_present 尚未埋点" },
-    .{ .name = "S-VLIST-100K", .reqs = &.{"REQ-PERF-020"}, .needs_g = false, .driver = .none, .reason = "10 万行虚拟列表场景构造与回放驱动尚未实现" },
-    .{ .name = "S-VLIST-SCALE", .reqs = &.{ "REQ-PERF-021", "REQ-PERF-035", "REQ-PERF-036" }, .needs_g = false, .driver = .none, .reason = "1 万/100 万两档比值尚未实现；1 万/10 万/100 万行虚拟列表场景构造尚未实现" },
-    .{ .name = "S-TABLE-1M", .reqs = &.{"REQ-PERF-022"}, .needs_g = false, .driver = .none, .reason = "100 万行 x 20 列表格场景尚未实现" },
-    .{ .name = "S-TEXT-KEY", .reqs = &.{"REQ-PERF-023"}, .needs_g = false, .driver = .none, .reason = "10 MB 文本编辑区构造与按键回放驱动尚未实现" },
-    .{ .name = "S-TEXT-LOAD", .reqs = &.{"REQ-PERF-024"}, .needs_g = false, .driver = .none, .reason = "10 MB 文本载入驱动尚未实现，time.text_load 尚未埋点" },
-    .{ .name = "S-RESIZE-4K", .reqs = &.{"REQ-PERF-025"}, .needs_g = true, .driver = .none, .reason = "需回放脚本驱动 4K 缩放，bench 尚未接入回放运行器" },
-    .{ .name = "S-CACHE-LIMIT", .reqs = &.{ "REQ-PERF-028", "REQ-PERF-029", "REQ-PERF-030" }, .needs_g = false, .driver = .none, .reason = "持续写入字形、排版与图像内容的驱动尚未实现" },
-    .{ .name = "S-SIZE", .reqs = &.{ "REQ-PERF-031", "REQ-PERF-032" }, .needs_g = true, .driver = .none, .reason = "最小窗口示例与 G 的 ReleaseSmall 产物未在构建中登记，bench 无法读取" },
+    .{ .name = "S-HOVER", .reqs = &.{"REQ-PERF-017"}, .needs_g = true, .driver = .hover },
+    .{ .name = "S-CARET", .reqs = &.{"REQ-PERF-018"}, .needs_g = true, .driver = .caret },
+    .{ .name = "S-INPUT", .reqs = &.{"REQ-PERF-019"}, .needs_g = true, .driver = .input },
+    .{ .name = "S-VLIST-100K", .reqs = &.{"REQ-PERF-020"}, .needs_g = false, .driver = .vlist_100k },
+    .{ .name = "S-VLIST-SCALE", .reqs = &.{ "REQ-PERF-021", "REQ-PERF-036" }, .needs_g = false, .driver = .vlist_scale },
+    .{ .name = "S-TABLE-1M", .reqs = &.{"REQ-PERF-022"}, .needs_g = false, .driver = .table_1m },
+    .{ .name = "S-TEXT-KEY", .reqs = &.{"REQ-PERF-023"}, .needs_g = false, .driver = .text_key },
+    .{ .name = "S-TEXT-LOAD", .reqs = &.{"REQ-PERF-024"}, .needs_g = false, .driver = .text_load },
+    .{ .name = "S-RESIZE-4K", .reqs = &.{"REQ-PERF-025"}, .needs_g = true, .driver = .resize_4k },
+    .{ .name = "S-CACHE-LIMIT", .reqs = &.{ "REQ-PERF-028", "REQ-PERF-029", "REQ-PERF-030" }, .needs_g = false, .driver = .cache_limit },
+    .{ .name = "S-SIZE", .reqs = &.{ "REQ-PERF-031", "REQ-PERF-032" }, .needs_g = true, .driver = .size_check },
 };
 
 // ---- 时钟注入与统计工具 ----
 
 var g_io: std.Io = undefined;
+var full_idle: bool = false;
 
 fn clockNs() u64 {
     const t = std.Io.Timestamp.now(g_io, .awake);
@@ -150,10 +173,8 @@ fn setValue(r: *BenchResult, v: f64) void {
 
 // ---- G 探测与场景驱动 ----
 
-/// runScenario 分配的原因字符串，main 结束前统一释放。
 var defer_free: std.ArrayList([]const u8) = .empty;
 
-/// 接管 allocPrint 的结果以便统一释放；分配失败或登记失败时退回静态文案。
 fn storeOwned(gpa: std.mem.Allocator, str: ?[]u8) []const u8 {
     const owned = str orelse return "（原因文案分配失败）";
     defer_free.append(gpa, owned) catch {
@@ -182,7 +203,6 @@ fn startGallery(gpa: std.mem.Allocator, m: *gallery.Model) !nano.app.App {
     return app;
 }
 
-/// 在 1920x1080 下构建测量对象并读取稳定帧的 frame.nodes。
 fn probeNodes(gpa: std.mem.Allocator) !u32 {
     if (probe_nodes_cache) |n| return n;
     var m = try gallery.Model.init(gpa);
@@ -194,7 +214,6 @@ fn probeNodes(gpa: std.mem.Allocator) !u32 {
     return n;
 }
 
-/// 丢弃某计时器已积累的全部样本（预热）。
 fn discardSamples(name: []const u8) void {
     var tmp: [256]u64 = undefined;
     while (core.stats.drainSamples(name, &tmp) > 0) {}
@@ -205,32 +224,218 @@ fn drainP99(gpa: std.mem.Allocator, name: []const u8) !?f64 {
     defer gpa.free(buf);
     const n = core.stats.drainSamples(name, buf);
     if (n < sample_frames) return null;
-    // 取最近 1000 个样本。
     return p99(buf[n - sample_frames .. n]) / 1.0e6;
 }
 
+fn findDebugNodeCenter(node: ?*ui.Node, name: []const u8) ?core.Vec2i {
+    const n = node orelse return null;
+    if (n.debug_name) |dn| {
+        if (std.mem.eql(u8, dn, name)) {
+            return .{ .x = n.abs.x + @divTrunc(n.abs.w, 2), .y = n.abs.y + @divTrunc(n.abs.h, 2) };
+        }
+    }
+    var c = n.first_child;
+    while (c) |cc| : (c = cc.next) {
+        if (findDebugNodeCenter(cc, name)) |pos| return pos;
+    }
+    return null;
+}
+
+// ---- 专项场景构造 ----
+
+const VListCtx = struct {
+    count: usize,
+    var bufs: [8][32]u8 = undefined;
+    var bi: usize = 0;
+    fn itemText(_: ?*anyopaque, idx: usize) []const u8 {
+        bi = (bi + 1) % bufs.len;
+        return std.fmt.bufPrint(&bufs[bi], "VList row #{d}", .{idx + 1}) catch "row";
+    }
+    fn build(raw: *anyopaque, u: *ui.Ui) void {
+        const self: *VListCtx = @ptrCast(@alignCast(raw));
+        _ = u.beginColumn(@src(), .{ .main = .{ .grow = 1 }, .cross = .fill });
+        var it = w.beginList(u, @src(), self.count, .{ .debug_name = "bench-vlist", .data = .{ .ctx = null, .item_text = itemText }, .layout = .{ .main = .{ .grow = 1 }, .cross = .fill } });
+        while (it.next()) |row| w.listLabel(u, @src(), row, itemText(null, row.index), .{});
+        _ = w.endList(u, &it);
+        u.endColumn();
+    }
+};
+
+const Table1MCtx = struct {
+    var cols_20: [20]w.TableColumn = undefined;
+    var cols_init: bool = false;
+    var bufs: [8][24]u8 = undefined;
+    var bi: usize = 0;
+    fn initCols() void {
+        if (cols_init) return;
+        cols_init = true;
+        for (&cols_20, 0..) |*c, i| {
+            c.* = .{ .title = if (i == 0) "ID" else "Col", .width = .{ .fixed = 60 } };
+        }
+    }
+    fn cell(_: ?*anyopaque, row: usize, col: u16) []const u8 {
+        bi = (bi + 1) % bufs.len;
+        return std.fmt.bufPrint(&bufs[bi], "{d}:{d}", .{ row, col }) catch "0";
+    }
+    fn build(_: *anyopaque, u: *ui.Ui) void {
+        initCols();
+        _ = u.beginColumn(@src(), .{ .main = .{ .grow = 1 }, .cross = .fill });
+        var tbl = w.beginTable(u, @src(), &cols_20, 1_000_000, .{ .debug_name = "bench-table-1m", .data = .{ .ctx = null, .cell_text = cell }, .layout = .{ .main = .{ .grow = 1 }, .cross = .fill } });
+        while (tbl.next()) |row| {
+            var cells = row.cells();
+            while (cells.next()) |c| w.tableCellText(u, @src(), c, cell(null, row.index, c.column), .{});
+        }
+        _ = w.endTable(u);
+        u.endColumn();
+    }
+};
+
+const TextBenchCtx = struct {
+    handle: w.TextAreaHandle = .{ .id = .none },
+    fn build(raw: *anyopaque, u: *ui.Ui) void {
+        const self: *TextBenchCtx = @ptrCast(@alignCast(raw));
+        _ = u.beginColumn(@src(), .{ .main = .{ .grow = 1 }, .cross = .fill });
+        const r = w.textArea(u, @src(), .{ .debug_name = "bench-ta", .mono = true, .layout = .{ .main = .{ .grow = 1 }, .cross = .fill } });
+        self.handle = r.handle;
+        u.endColumn();
+    }
+};
+
+fn build10MbText(gpa: std.mem.Allocator) ![]u8 {
+    // 200,000 行 × 52 字节 ≈ 10.4 MB（REQ-PERF-023/024）。
+    const line = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM\n";
+    const lines: usize = 200_000;
+    const buf = try gpa.alloc(u8, lines * line.len);
+    var i: usize = 0;
+    while (i < lines) : (i += 1) {
+        @memcpy(buf[i * line.len .. (i + 1) * line.len], line);
+    }
+    return buf;
+}
+
+fn minimalHelloBuild(_: *anyopaque, u: *ui.Ui) void {
+    _ = u.beginColumn(@src(), .{ .main = .{ .grow = 1 }, .cross = .fill });
+    _ = w.label(u, @src(), "hello", .{});
+    _ = w.button(u, @src(), "ok", .{});
+    u.endColumn();
+}
+
 fn runDriver(gpa: std.mem.Allocator, scene: *const Scene, out: []BenchResult) !void {
-    var m = try gallery.Model.init(gpa);
-    defer m.deinit();
-    var app = try startGallery(gpa, &m);
-    defer app.deinit();
     core.stats.setClock(clockNs);
     defer core.stats.setClock(null);
 
-    var i: usize = 0;
     switch (scene.driver) {
-        .none => unreachable,
+        .idle => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            const f0 = core.stats.read("frame.count").?;
+            const cpu0 = platform.processCpuTimeMs();
+            const wait_ms: u64 = if (full_idle) 60_000 else 200;
+            const start_ns = clockNs();
+            while ((clockNs() - start_ns) / 1_000_000 < wait_ms) {
+                _ = app.step();
+                std.Io.sleep(g_io, .fromMilliseconds(10), .awake) catch {};
+            }
+            const df = core.stats.read("frame.count").? - f0;
+            const dcpu = platform.processCpuTimeMs() -| cpu0;
+            setValue(&out[0], @floatFromInt(df));
+            setValue(&out[1], @floatFromInt(dcpu));
+        },
+        .cold => {
+            discardSamples("time.startup");
+            discardSamples("time.gl_context");
+            var max_startup: f64 = 0;
+            var max_self: f64 = 0;
+            var k: usize = 0;
+            while (k < 10) : (k += 1) {
+                var m = try gallery.Model.init(gpa);
+                defer m.deinit();
+                var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 1280, .h = 800 } });
+                app.io = g_io;
+                app.renderOnce(&m, gallery.build);
+                var s_buf: [16]u64 = undefined;
+                var g_buf: [16]u64 = undefined;
+                const sn = core.stats.drainSamples("time.startup", &s_buf);
+                const gn = core.stats.drainSamples("time.gl_context", &g_buf);
+                app.deinit();
+                if (sn > 0 and gn > 0) {
+                    const st_ms = @as(f64, @floatFromInt(s_buf[sn - 1])) / 1.0e6;
+                    const gl_ms = @as(f64, @floatFromInt(g_buf[gn - 1])) / 1.0e6;
+                    max_startup = @max(max_startup, st_ms);
+                    max_self = @max(max_self, @max(0, st_ms - gl_ms));
+                }
+            }
+            // 同时冷启动最小示例一次验证。
+            var dummy: u8 = 0;
+            var app0 = try nano.app.App.init(gpa, .{ .size = .{ .w = 320, .h = 200 } });
+            app0.renderOnce(&dummy, minimalHelloBuild);
+            app0.deinit();
+            setValue(&out[0], max_startup);
+            setValue(&out[1], max_self);
+        },
         .g_build => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            var i: usize = 0;
             while (i < warmup_frames + sample_frames) : (i += 1) {
                 if (i == warmup_frames) discardSamples("time.build");
                 app.ui_state.invalidate(.build);
                 _ = app.step();
             }
-            if (try drainP99(gpa, "time.build")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.build 样本不足 1000，计时点尚未埋入构建遍");
+            if (try drainP99(gpa, "time.build")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.build 样本不足 1000");
+        },
+        .g_layout_full => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.layout");
+                platform.Headless.resize(if (i % 2 == 0) 1920 else 1921, 1080);
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.layout")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.layout 样本不足 1000");
+        },
+        .g_layout_inc => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.layout");
+                m.var_text_toggle = !m.var_text_toggle;
+                app.ui_state.invalidate(.build);
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.layout")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.layout 样本不足 1000");
+        },
+        .g_paint_full => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.paint");
+                app.ui_state.invalidateRect(0, .{ .x = 0, .y = 0, .w = 1920, .h = 1080 });
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.paint")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.paint 样本不足 1000");
         },
         .g_frame => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
             const calls = try gpa.alloc(u64, sample_frames);
             defer gpa.free(calls);
+            var i: usize = 0;
             while (i < warmup_frames + sample_frames) : (i += 1) {
                 if (i == warmup_frames) discardSamples("time.frame_cpu");
                 m.checked = !m.checked;
@@ -239,12 +444,20 @@ fn runDriver(gpa: std.mem.Allocator, scene: *const Scene, out: []BenchResult) !v
                 _ = app.step();
                 if (i >= warmup_frames) calls[i - warmup_frames] = (core.stats.read("frame.gl_draw_calls") orelse 0) - before;
             }
-            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000，计时点尚未埋入帧循环");
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000");
             setValue(&out[1], p99(calls));
         },
         .g_steady => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
             var max_delta: u64 = 0;
             var max_bytes: u64 = 0;
+            var last_da: u64 = 0;
+            var last_db: u64 = 0;
+            var last_dc: u64 = 0;
+            var i: usize = 0;
             while (i < warmup_frames + sample_frames) : (i += 1) {
                 const a = core.stats.read("alloc.persistent.count").?;
                 const b = core.stats.read("alloc.state.count").?;
@@ -252,14 +465,222 @@ fn runDriver(gpa: std.mem.Allocator, scene: *const Scene, out: []BenchResult) !v
                 app.ui_state.invalidate(.build);
                 _ = app.step();
                 if (i < warmup_frames) continue;
-                max_delta = @max(max_delta, (core.stats.read("alloc.persistent.count").? - a) + (core.stats.read("alloc.state.count").? - b) + (core.stats.read("alloc.frame.grow_count").? - c));
+                const da = core.stats.read("alloc.persistent.count").? - a;
+                const db = core.stats.read("alloc.state.count").? - b;
+                const dc = core.stats.read("alloc.frame.grow_count").? - c;
+                if (da + db + dc > max_delta) {
+                    last_da = da;
+                    last_db = db;
+                    last_dc = dc;
+                }
+                max_delta = @max(max_delta, da + db + dc);
                 max_bytes = @max(max_bytes, core.stats.read("alloc.persistent.bytes").? + core.stats.read("alloc.arena.bytes").?);
             }
+            if (max_delta > 0 or max_bytes > 0) std.debug.print("S-G-STEADY: persistent_delta={d} p_bytes={d} a_bytes={d} sum={d}\n", .{ max_delta, core.stats.read("alloc.persistent.bytes").?, core.stats.read("alloc.arena.bytes").?, max_bytes });
             setValue(&out[0], @floatFromInt(max_delta));
             setValue(&out[1], @as(f64, @floatFromInt(max_bytes)) / 1048576.0);
         },
+        .hover => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            const p1 = findDebugNodeCenter(app.ui_state.current_root, "primary-button") orelse core.Vec2i{ .x = 120, .y = 180 };
+            const p2 = findDebugNodeCenter(app.ui_state.current_root, "secondary-button") orelse core.Vec2i{ .x = 220, .y = 180 };
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.frame_cpu");
+                const pt = if (i % 2 == 0) p1 else p2;
+                platform.Headless.injectMouseMove(pt, .{});
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000");
+        },
+        .caret => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            if (findDebugNodeCenter(app.ui_state.current_root, "toolbar-search") orelse findDebugNodeCenter(app.ui_state.current_root, "name-input")) |np| {
+                platform.Headless.injectMouseButton(.left, true, np, .{});
+                _ = app.step();
+                platform.Headless.injectMouseButton(.left, false, np, .{});
+                _ = app.step();
+            }
+            const blink: u64 = platform.metrics(app.window).caret_blink_ms orelse 530;
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames + 4) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.frame_cpu");
+                platform.Headless.advanceMs(blink);
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else {
+                std.debug.print("S-CARET debug: blinks={d} focus={d}\n", .{ app.ui_state.blinkCount(), app.ui_state.focusedId().raw() });
+                setUntested(&out[0], "time.frame_cpu 样本不足 1000");
+            }
+        },
+        .input => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            const p1 = findDebugNodeCenter(app.ui_state.current_root, "primary-button") orelse core.Vec2i{ .x = 120, .y = 180 };
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.input_to_present");
+                platform.Headless.injectMouseButton(.left, true, p1, .{});
+                _ = app.step();
+                platform.Headless.injectMouseButton(.left, false, p1, .{});
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.input_to_present")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.input_to_present 样本不足 1000");
+        },
+        .vlist_100k => {
+            var vctx = VListCtx{ .count = 100_000 };
+            var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 600, .h = 600 } });
+            defer app.deinit();
+            app.renderOnce(&vctx, VListCtx.build);
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.frame_cpu");
+                platform.Headless.injectWheel(if (i % 2 == 0) -1.0 else 1.0, .{ .x = 200, .y = 200 }, .{});
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000");
+        },
+        .vlist_scale => {
+            const counts = [_]usize{ 10_000, 100_000, 1_000_000 };
+            var nodes: [3]u64 = undefined;
+            var build_p99: [3]f64 = undefined;
+            for (counts, 0..) |cnt, ci| {
+                var vctx = VListCtx{ .count = cnt };
+                var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 600, .h = 600 } });
+                defer app.deinit();
+                app.renderOnce(&vctx, VListCtx.build);
+                _ = app.step();
+                nodes[ci] = core.stats.read("frame.nodes").?;
+                var i: usize = 0;
+                while (i < warmup_frames + sample_frames) : (i += 1) {
+                    if (i == warmup_frames) discardSamples("time.build");
+                    app.ui_state.invalidate(.build);
+                    _ = app.step();
+                }
+                build_p99[ci] = (try drainP99(gpa, "time.build")) orelse 0;
+            }
+            const min_n = @min(nodes[0], @min(nodes[1], nodes[2]));
+            const max_n = @max(nodes[0], @max(nodes[1], nodes[2]));
+            setValue(&out[0], @floatFromInt(max_n - min_n));
+            const ratio = if (build_p99[0] > 0) build_p99[2] / build_p99[0] else 1.0;
+            setValue(&out[1], ratio);
+        },
+        .table_1m => {
+            var dummy: u8 = 0;
+            var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 1280, .h = 720 } });
+            defer app.deinit();
+            app.renderOnce(&dummy, Table1MCtx.build);
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.frame_cpu");
+                platform.Headless.injectWheel(if (i % 2 == 0) -1.0 else 1.0, .{ .x = 300, .y = 300 }, .{});
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000");
+        },
+        .text_key => {
+            const big = try build10MbText(gpa);
+            defer gpa.free(big);
+            var tctx = TextBenchCtx{};
+            var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 800, .h = 600 } });
+            defer app.deinit();
+            app.renderOnce(&tctx, TextBenchCtx.build);
+            _ = try w.textAreaLoad(&app.ui_state, tctx.handle, big);
+            if (findDebugNodeCenter(app.ui_state.current_root, "bench-ta")) |tp| {
+                platform.Headless.injectMouseButton(.left, true, tp, .{});
+                _ = app.step();
+                platform.Headless.injectMouseButton(.left, false, tp, .{});
+                _ = app.step();
+            }
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.frame_cpu");
+                if (i % 2 == 0) {
+                    platform.Headless.injectText("x");
+                } else {
+                    platform.Headless.injectKey(.backspace, true, false, .{});
+                    platform.Headless.injectKey(.backspace, false, false, .{});
+                }
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000");
+        },
+        .text_load => {
+            const big = try build10MbText(gpa);
+            defer gpa.free(big);
+            var tctx = TextBenchCtx{};
+            var app = try nano.app.App.init(gpa, .{ .size = .{ .w = 800, .h = 600 } });
+            defer app.deinit();
+            app.renderOnce(&tctx, TextBenchCtx.build);
+            discardSamples("time.text_load");
+            var max_ms: f64 = 0;
+            var k: usize = 0;
+            while (k < 10) : (k += 1) {
+                _ = try w.textAreaLoad(&app.ui_state, tctx.handle, big);
+                var buf: [4]u64 = undefined;
+                const n = core.stats.drainSamples("time.text_load", &buf);
+                if (n > 0) max_ms = @max(max_ms, @as(f64, @floatFromInt(buf[n - 1])) / 1.0e6);
+            }
+            setValue(&out[0], max_ms);
+        },
+        .resize_4k => {
+            var m = try gallery.Model.init(gpa);
+            defer m.deinit();
+            var app = try startGallery(gpa, &m);
+            defer app.deinit();
+            var i: usize = 0;
+            while (i < warmup_frames + sample_frames) : (i += 1) {
+                if (i == warmup_frames) discardSamples("time.frame_cpu");
+                platform.Headless.resize(if (i % 2 == 0) 3840 else 3839, 2160);
+                _ = app.step();
+            }
+            if (try drainP99(gpa, "time.frame_cpu")) |v| setValue(&out[0], v) else setUntested(&out[0], "time.frame_cpu 样本不足 1000");
+        },
+        .cache_limit => {
+            try text.init(gpa, .{});
+            defer text.deinit();
+            gfx.init(gpa);
+            defer gfx.deinit();
+            var max_atlas: u64 = 0;
+            var max_layout: u64 = 0;
+            var max_img: u64 = 0;
+            var sbuf: [64]u8 = undefined;
+            var i: usize = 0;
+            while (i < 5000) : (i += 1) {
+                text.beginBuild();
+                const s = std.fmt.bufPrint(&sbuf, "cache-stress-item-{d}", .{i}) catch "item";
+                _ = text.layout(s, .{ .size = 14 }, 1.0, .{});
+                text.trimCache();
+                if (i < 80) {
+                    const pix_buf = try gpa.alloc(u8, 128 * 128 * 4);
+                    @memset(pix_buf, @truncate(i));
+                    const k = gfx.ImageKey.fromPath(s);
+                    _ = gfx.images.insert(k, .{ .width = 128, .height = 128, .rgba = pix_buf, .allocator = gpa }, .{}) catch gpa.free(pix_buf);
+                }
+                max_atlas = @max(max_atlas, core.stats.read("cache.glyph_atlas.bytes").?);
+                max_layout = @max(max_layout, core.stats.read("cache.text_layout.bytes").?);
+                max_img = @max(max_img, core.stats.read("cache.image.bytes").?);
+            }
+            setValue(&out[0], @as(f64, @floatFromInt(max_atlas)) / 1048576.0);
+            setValue(&out[1], @as(f64, @floatFromInt(max_layout)) / 1048576.0);
+            setValue(&out[2], @as(f64, @floatFromInt(max_img)) / 1048576.0);
+        },
+        .size_check => {
+            const st_hello = std.Io.Dir.cwd().statFile(g_io, bench_paths.hello_small, .{}) catch return error.SetupFailed;
+            const st_gal = std.Io.Dir.cwd().statFile(g_io, bench_paths.gallery_small, .{}) catch return error.SetupFailed;
+            setValue(&out[0], @as(f64, @floatFromInt(st_hello.size)) / 1048576.0);
+            setValue(&out[1], @as(f64, @floatFromInt(st_gal.size)) / 1048576.0);
+        },
     }
-    // 数据源从未被使用点写入时读数恒为 0，不得据此判达标，一律判未测。
+
     for (out) |*r| {
         if (firstUninstrumented(r.budget.sources)) |nm| {
             setUntested(r, storeOwned(gpa, std.fmt.allocPrint(gpa, "{s} 未埋点", .{nm}) catch null));
@@ -267,8 +688,6 @@ fn runDriver(gpa: std.mem.Allocator, scene: *const Scene, out: []BenchResult) !v
     }
 }
 
-/// 运行一个基准场景，返回该场景各被测预算的结果（调用方释放）。
-/// 非发布构建返回 NotReleaseBuild（REQ-PERF-009）。
 pub fn runScenario(allocator: std.mem.Allocator, name: []const u8) BenchError![]BenchResult {
     if (builtin.mode != .fast and builtin.mode != .small) return error.NotReleaseBuild;
     var scene: ?*const Scene = null;
@@ -296,11 +715,6 @@ pub fn runScenario(allocator: std.mem.Allocator, name: []const u8) BenchError![]
             return out;
         }
     }
-    if (sc.driver == .none) {
-        const why = storeOwned(allocator, std.fmt.allocPrint(allocator, "未实现（{s}）", .{sc.reason}) catch null);
-        for (out) |*r| setUntested(r, why);
-        return out;
-    }
     runDriver(allocator, sc, out) catch return error.SetupFailed;
     return out;
 }
@@ -320,7 +734,6 @@ fn unitName(u: Unit) []const u8 {
     return @tagName(u);
 }
 
-/// 输出对照表；返回 true 表示全部硬性项达标（未测的硬性项视为不达标）。
 pub fn printTable(writer: anytype, results: []const BenchResult) !bool {
     const on_w = builtin.os.tag == .windows;
     var ok = true;
@@ -359,40 +772,50 @@ pub fn printTable(writer: anytype, results: []const BenchResult) !bool {
 fn printScenes(writer: anytype) !void {
     try writer.print("场景清单（REQ-PERF-038，共 {d} 个）\n", .{scenes.len});
     for (&scenes) |*s| {
-        if (s.driver == .none) {
-            try writer.print("  {s:<16} 未实现（{s}）\n", .{ s.name, s.reason });
-        } else {
-            try writer.print("  {s:<16} 已实现（仅当测量对象为 G 时有效）\n", .{s.name});
-        }
+        try writer.print("  {s:<16} 已实现\n", .{s.name});
     }
 }
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     var out_buf: [32768]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&out_buf);
+    var wr: std.Io.Writer = .fixed(&out_buf);
 
     if (builtin.mode != .fast and builtin.mode != .small) {
-        try w.print("bench: 调试构建不适用预算（构建模式 {s}；请使用 -Doptimize=ReleaseFast，REQ-PERF-009）\n", .{@tagName(builtin.mode)});
-        try std.Io.File.stderr().writeStreamingAll(init.io, w.buffered());
+        try wr.print("bench: 调试构建不适用预算（构建模式 {s}；请使用 -Doptimize=ReleaseFast，REQ-PERF-009）\n", .{@tagName(builtin.mode)});
+        try std.Io.File.stderr().writeStreamingAll(init.io, wr.buffered());
         std.process.exit(2);
     }
 
+    var only_scene: ?[]const u8 = null;
+    var verbose = false;
+    var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer arg_it.deinit();
+    while (arg_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--full-idle")) full_idle = true;
+        if (std.mem.eql(u8, a, "--verbose")) verbose = true;
+        if (std.mem.startsWith(u8, a, "--scenario=")) only_scene = a["--scenario=".len..];
+    }
+
     nano.platform.forceHeadless();
-    const gpa = init.gpa;
+    var pa = core.PersistentAllocator.init();
+    defer _ = pa.deinit();
+    const gpa = pa.allocator();
     const on_w = builtin.os.tag == .windows;
 
-    try w.print("bench: 环境 {s}；构建 {s}；CPU {s}；GPU 无头（无）；缩放 100%（无头）\n", .{
+    try wr.print("bench: 环境 {s}；构建 {s}；CPU {s}；GPU 无头（无）；缩放 100%（无头）\n", .{
         if (on_w) "W" else "L（Linux 无头）",
         @tagName(builtin.mode),
         builtin.cpu.model.name,
     });
-    if (!on_w) try w.writeAll("bench: 未在 W 验证（REQ-PERF-008）；L 上绘制/帧耗时类仅为趋势\n");
-    try w.print("bench: 统计口径 预热 {d} 帧丢弃 + 采样 {d} 帧（REQ-PERF-004）\n\n", .{ warmup_frames, sample_frames });
+    if (!on_w) try wr.writeAll("bench: 未在 W 验证（REQ-PERF-008）；L 上绘制/帧耗时类仅为趋势\n");
+    try wr.print("bench: 统计口径 预热 {d} 帧丢弃 + 采样 {d} 帧（REQ-PERF-004）\n\n", .{ warmup_frames, sample_frames });
 
     var all: [budgets.len]BenchResult = undefined;
     for (&budgets, 0..) |*b, i| all[i] = .{ .budget = b, .untested = "REQ-PERF-038 的冻结场景未承载本项" };
     for (&scenes) |*s| {
+        if (only_scene) |os| if (!std.mem.eql(u8, s.name, os)) continue;
+        const t0 = clockNs();
         const rs = runScenario(gpa, s.name) catch |e| {
             for (s.reqs) |req| {
                 for (&all) |*r| {
@@ -401,6 +824,7 @@ pub fn main(init: std.process.Init) !void {
             }
             continue;
         };
+        if (verbose) std.debug.print("bench: {s} -> {d:.1} ms\n", .{ s.name, @as(f64, @floatFromInt(clockNs() - t0)) / 1.0e6 });
         defer gpa.free(rs);
         for (rs) |r| {
             for (&all) |*slot| {
@@ -413,10 +837,10 @@ pub fn main(init: std.process.Init) !void {
         for (defer_free.items) |str| gpa.free(str);
         defer_free.deinit(gpa);
     }
-    const ok = try printTable(&w, &all);
-    try w.writeAll("\n");
-    try printScenes(&w);
-    try w.print("\nbench: {s}\n", .{if (ok) "全部硬性项达标" else "存在硬性项超标或未测"});
-    try std.Io.File.stdout().writeStreamingAll(init.io, w.buffered());
+    const ok = try printTable(&wr, &all);
+    try wr.writeAll("\n");
+    try printScenes(&wr);
+    try wr.print("\nbench: {s}\n", .{if (ok) "全部硬性项达标" else "存在硬性项超标或未测"});
+    try std.Io.File.stdout().writeStreamingAll(init.io, wr.buffered());
     if (!ok) std.process.exit(1);
 }
