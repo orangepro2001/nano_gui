@@ -16,3 +16,4 @@ Thumbs.db
 # 文档哈希临时文件
 docs.sha256.current
 docs.sha256.before
+.zig-cache
