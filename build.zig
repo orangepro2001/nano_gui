@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
         mod.addIncludePath(b.path("third_party/nanovg"));
         mod.addIncludePath(b.path("third_party"));
         mod.link_libc = true;
+        for ([_][]const u8{ "user32", "gdi32", "comdlg32", "shell32", "ole32", "imm32", "dwrite", "opengl32" }) |lib| mod.linkSystemLibrary(lib, .{});
         mod.addCSourceFiles(.{
             .root = b.path("third_party"),
             .files = &.{ "nanovg_win32_impl.c", "nanovg/nanovg.c" },

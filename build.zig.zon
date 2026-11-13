@@ -8,9 +8,9 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "examples",
-        "tests",
-        "tools",
         "third_party",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+        "README.md",
     },
 }

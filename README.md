@@ -17,6 +17,27 @@
 | 某个控件该怎么表现 | [docs/10-widgets/](docs/10-widgets/)（范本：[button.md](docs/10-widgets/button.md)） |
 | 怎样算做完 | [docs/acceptance/](docs/acceptance/) |
 
+## 在其他项目中使用
+
+需要 Zig 0.17.1 或更新版本。
+
+```sh
+zig fetch --save git+https://github.com/orangepro2001/nano_gui.git#v0.1.0
+```
+
+`build.zig`：
+
+```zig
+const nano = b.dependency("nano_gui", .{
+    .target = target,
+    .optimize = optimize,
+    // 可选：.@"text-backend" = "fontstash",  // Windows 默认 directwrite，其他平台默认 fixed
+});
+exe.root_module.addImport("nano_gui", nano.module("nano_gui"));
+```
+
+代码中 `const nano = @import("nano_gui");`，最小示例见 `examples/hello.zig`。Windows 上的系统库由模块自动链接；Linux 上的窗口宿主（X11/GLFW）由应用自行提供，参考仓库内 `examples/gallery_window.zig`。
+
 ## 一句话原则
 
 规范先于代码；想改行为，先改文档（涉及已定决策时先改 ADR），再改实现。
