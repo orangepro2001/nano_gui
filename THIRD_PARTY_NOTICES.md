@@ -1,9 +1,23 @@
 # Third-party notices
 
-- **NanoVG** (`third_party/nanovg`): zlib license. Copyright (c) 2009-2013 Mikko Monoi.
-  Vendored source plus a local `nanovg_gl3.c` compile unit; see `PATCHES.md`.
-- **stb_truetype.h / stb_image.h** (inside NanoVG): public domain / MIT OR Unlicense.
-- **GLFW** (Linux build only, system library): zlib license.
-- **GLEW** (Linux build only, system library): MIT/BSD-style license.
+## NanoVG
+- 路径: `third_party/nanovg`
+- 上游地址: https://github.com/memononen/nanovg
+- 版本: master (fetched 2026-11-12)
+- SPDX: Zlib
+- 许可文本: `third_party/nanovg/LICENSE.txt`
+
+## DejaVu Sans
+- 路径: `third_party/fonts`
+- 上游地址: https://dejavu-fonts.github.io/
+- 版本: 2.37
+- SPDX: Bitstream-Vera
+- 许可文本: `third_party/fonts/LICENSE-DejaVu.txt`
+- 来源字体: DejaVu Sans
+- 子集化范围: 全集
+
+### 系统库（仅链接）
+- **GLFW**（仅 Linux 构建，系统库）：zlib license。
+- **GLEW**（仅 Linux 构建，系统库）：MIT/BSD-style license。
 
 The project itself is MIT licensed; see `LICENSE`.
