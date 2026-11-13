@@ -9,6 +9,10 @@ const core = @import("core.zig");
 const gfx = @import("gfx.zig");
 const platform = @import("platform.zig");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const fons_backend = @import("text/fontstash.zig");
+
+const enable_fontstash = std.mem.eql(u8, build_options.text_backend, "fontstash");
 
 var backend_allocator: ?std.mem.Allocator = null;
 var use_directwrite: bool = false;
@@ -189,18 +193,42 @@ fn cacheClear() void {
     cacheReport();
 }
 
-pub const backend_name: []const u8 = "fixed";
+pub const backend_name: []const u8 = build_options.text_backend;
 pub const directwrite = @import("text/directwrite.zig");
 
 pub const Family = enum(u16) { ui, mono, _ };
-pub fn registerFamily(_: []const u8) error{OutOfMemory}!Family {
-    return .ui;
+
+var custom_families: std.ArrayListUnmanaged([]u8) = .empty;
+var atlas_pages: u32 = 0;
+var atlas_rgba_pages: u32 = 0;
+var atlas_used_ppx: u64 = 0;
+var atlas_raster_count: u64 = 0;
+var atlas_shape_count: u64 = 0;
+
+/// 注册自定义字体族名（框架复制名称；REQ-TEXT-001）。线程：界面线程。
+pub fn registerFamily(name: []const u8) error{OutOfMemory}!Family {
+    const alloc = backend_allocator orelse std.heap.smp_allocator;
+    for (custom_families.items, 0..) |existing, i| {
+        if (std.mem.eql(u8, existing, name)) return @fromBackingInt(@intCast(@as(u16, @intCast(i + 2))));
+    }
+    const copy = try alloc.dupe(u8, name);
+    errdefer alloc.free(copy);
+    try custom_families.append(alloc, copy);
+    return @fromBackingInt(@intCast(@as(u16, @intCast(custom_families.items.len + 1))));
 }
+
+/// 解析字体族对应的系统字体族名（REQ-TEXT-001）。线程：界面线程。
 pub fn resolvedFamily(f: Family) []const u8 {
     return switch (f) {
         .ui => "Segoe UI",
         .mono => "Cascadia Mono",
-        else => "Segoe UI",
+        _ => {
+            const idx = @backingInt(f);
+            if (idx >= 2 and idx - 2 < custom_families.items.len) {
+                return custom_families.items[idx - 2];
+            }
+            return "Segoe UI";
+        },
     };
 }
 
@@ -411,8 +439,21 @@ pub const Layout = struct {
     }
 
     pub fn imeRects(self: *const Layout, comp: Composition) struct { caret: CaretRect, target: ?core.Rect } {
-        const r = self.caretRect(.{ .offset = comp.start + comp.cursor });
-        return .{ .caret = r, .target = null };
+        const r = self.caretRect(.{ .offset = @min(comp.start + comp.cursor, self.text_len) });
+        var target: ?core.Rect = null;
+        for (comp.segments) |seg| {
+            if (seg.style == .target_converted or seg.style == .target_unconverted) {
+                const s = @min(comp.start + seg.start, self.text_len);
+                const e = @min(comp.start + seg.end, self.text_len);
+                if (e > s) {
+                    const a = self.caretRect(.{ .offset = s });
+                    const b = self.caretRect(.{ .offset = e });
+                    target = .{ .x = a.x, .y = a.y, .w = @max(1.0, b.x - a.x), .h = a.h };
+                    break;
+                }
+            }
+        }
+        return .{ .caret = r, .target = target };
     }
 
     fn alignOffset(self: *const Layout, line_w: f32) f32 {
@@ -550,15 +591,19 @@ pub fn layoutOwned(allocator: std.mem.Allocator, text_in: []const u8, style: Sty
         .lines_buf = try lines.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+    atlas_shape_count += 1;
     return .{ .layout = layout_ptr };
 }
 
-pub fn measure(text: []const u8, style: Style, scale: f32, opts: LayoutOptions) core.Size {
+pub fn measure(text_in: []const u8, style: Style, scale: f32, opts: LayoutOptions) core.Size {
     var effective = opts;
     effective.max_width = null;
-    const l = layoutOwned(requireInit(@src()), text, style, scale, effective) catch return .{};
-    defer l.layout.deinit();
-    return l.layout.size;
+    if (!isInitialized()) {
+        const l = layoutOwned(std.heap.smp_allocator, text_in, style, scale, effective) catch return .{};
+        defer l.layout.deinit();
+        return l.layout.size;
+    }
+    return layout(text_in, style, scale, effective).size;
 }
 
 pub fn isTruncated(text: []const u8, style: Style, scale: f32, max_width: f32) bool {
@@ -566,6 +611,10 @@ pub fn isTruncated(text: []const u8, style: Style, scale: f32, max_width: f32) b
 }
 
 pub fn fontMetrics(style: Style, scale: f32) FontMetrics {
+    if (enable_fontstash and fons_backend.isReady()) {
+        const m = fons_backend.vertMetrics(style.size * scale);
+        return .{ .ascent = m.ascent, .descent = m.descent, .line_gap = 0, .height = m.lineh };
+    }
     const size = style.size * scale;
     return .{ .ascent = size, .descent = size * 0.25, .line_gap = 0, .height = @ceil(size * 1.25) };
 }
@@ -581,6 +630,10 @@ pub fn advance(style: Style, scale: f32) f32 {
 }
 
 fn advanceOf(text: []const u8, style: Style, scale: f32) f32 {
+    if (enable_fontstash and fons_backend.isReady()) {
+        const w = fons_backend.textWidth(style.size * scale, text);
+        if (w > 0) return w;
+    }
     return advance(style, scale) * @as(f32, @floatFromInt(core.codepointCount(text)));
 }
 
@@ -632,6 +685,20 @@ pub const ColorSpan = struct { start: u32, end: u32, color: core.Color };
 pub const DrawOptions = struct { spans: []const ColorSpan = &.{}, line_range: ?Range = null };
 
 pub fn draw(canvas: *gfx.Canvas, l: *const Layout, origin: core.Vec2, color: core.Color, opts: DrawOptions) void {
+    if (enable_fontstash and fons_backend.isReady()) {
+        for (l.lines_buf, 0..) |line, li| {
+            if (opts.line_range) |r| if (li < r.start or li > r.end) continue;
+            const xoff = switch (l.opts.@"align") {
+                .left => 0,
+                .center => @floor((l.size.w - line.width) * 0.5),
+                .right => l.size.w - line.width,
+            };
+            const x = (origin.x + xoff) * l.scale;
+            const y = (origin.y + line.y) * l.scale;
+            fons_backend.drawLine(canvas, l.style.size * l.scale, x, y, l.text[line.start..line.end], color);
+        }
+        return;
+    }
     if (use_directwrite and builtin.os.tag == .windows) {
         directwrite.draw(l.allocator, canvas, l.text, l.style.size, l.style.weight, resolvedFamily(l.style.family), origin, color) catch {};
         return;
@@ -651,13 +718,14 @@ pub fn draw(canvas: *gfx.Canvas, l: *const Layout, origin: core.Vec2, color: cor
         var byte = line.start;
         while (byte < line.end) {
             const r = core.nextCodepoint(l.text, byte);
-            const cw = adv * @as(f32, @floatFromInt(@max(@as(usize, 1), r.len)));
+            const cw = adv;
             var c = color;
             for (opts.spans) |sp| {
                 if (byte >= sp.start and byte < sp.end) c = sp.color;
             }
             if (r.cp != ' ') {
                 drawGlyph(canvas, x, origin.y + line.y, glyph_w, glyph_h, r.cp, c);
+                atlas_raster_count += 1;
             }
             x += cw;
             byte += @intCast(@max(1, r.len));
@@ -703,12 +771,61 @@ pub const CompositionStyle = struct {
     target_bg: ?core.Color = null,
 };
 
+/// 绘制输入法组字下划线与目标子句背景（REQ-TEXT-039）。线程：界面线程。
 pub fn drawComposition(canvas: *gfx.Canvas, l: *const Layout, origin: core.Vec2, comp: Composition, style: CompositionStyle) void {
-    _ = l;
-    _ = origin;
-    _ = comp;
-    _ = style;
-    _ = canvas;
+    if (comp.len == 0) return;
+    const hairline: f32 = @max(1.0, @floor(l.scale)) / l.scale;
+    const fm = fontMetrics(l.style, l.scale);
+    const ppx_size = l.style.size * l.scale;
+    const ul_off = @max(1.0, @round(0.1 * ppx_size)) / l.scale;
+    const ul_y_off = fm.ascent + ul_off;
+
+    for (comp.segments) |seg| {
+        const s_off = @min(comp.start + seg.start, l.text_len);
+        const e_off = @min(comp.start + seg.end, l.text_len);
+        if (e_off <= s_off) continue;
+        const line_s = l.lineOf(.{ .offset = s_off });
+        const line_e = l.lineOf(.{ .offset = e_off });
+        var li = line_s;
+        while (li <= line_e) : (li += 1) {
+            const lr = l.lineRange(li);
+            const seg_s = @max(s_off, lr.start);
+            const seg_e = @min(e_off, lr.end);
+            if (seg_e <= seg_s) continue;
+            const c0 = l.caretRect(.{ .offset = seg_s });
+            const c1 = l.caretRect(.{ .offset = seg_e });
+            const x0 = origin.x + c0.x;
+            const w = @max(hairline, c1.x - c0.x);
+            const y0 = origin.y + l.lines_buf[li].y;
+            if ((seg.style == .target_converted or seg.style == .target_unconverted) and style.target_bg != null) {
+                canvas.fillRect(.{ .x = x0, .y = y0, .w = w, .h = c0.h }, style.target_bg.?);
+            }
+            const col = switch (seg.style) {
+                .target_converted, .target_unconverted => style.target_underline,
+                .@"error" => style.error_underline,
+                .unconverted, .converted => style.underline,
+            };
+            const thick = switch (seg.style) {
+                .target_converted, .target_unconverted, .@"error" => hairline * 2.0,
+                .unconverted, .converted => hairline,
+            };
+            const dotted = seg.style == .unconverted or seg.style == .target_unconverted;
+            const uy = y0 + ul_y_off;
+            if (!dotted) {
+                canvas.fillRect(.{ .x = x0, .y = uy, .w = w, .h = thick }, col);
+            } else {
+                var dx: f32 = 0;
+                while (dx < w) : (dx += hairline * 2.0) {
+                    const dw = @min(hairline, w - dx);
+                    canvas.fillRect(.{ .x = x0 + dx, .y = uy, .w = dw, .h = thick }, col);
+                }
+            }
+        }
+    }
+}
+
+pub fn isInitialized() bool {
+    return backend_allocator != null;
 }
 
 pub fn init(allocator: std.mem.Allocator, config: Config) error{OutOfMemory}!void {
@@ -719,9 +836,24 @@ pub fn init(allocator: std.mem.Allocator, config: Config) error{OutOfMemory}!voi
     if (builtin.os.tag == .windows) {
         _ = @import("text/directwrite.zig").ensureFactory();
     }
+    if (enable_fontstash) {
+        fons_backend.init() catch return error.OutOfMemory;
+    }
 }
 pub fn deinit() void {
     cacheClear();
+    if (backend_allocator) |a| {
+        for (custom_families.items) |name| a.free(name);
+        custom_families.deinit(a);
+        custom_families = .empty;
+    }
+    if (comptime enable_fontstash) {
+        fons_backend.deinit();
+    }
+    atlas_pages = 0;
+    atlas_rgba_pages = 0;
+    atlas_used_ppx = 0;
+    core.stats.gauge("cache.glyph_atlas.bytes").* = 0;
     backend_allocator = null;
 }
 pub fn beginBuild() void {
@@ -762,8 +894,14 @@ pub const testing = struct {
     pub fn reset() void {
         count = 0;
     }
-    pub fn atlasStats() struct { pages: u32, used_ppx: u64, raster_count: u64, shape_count: u64 } {
-        return .{ .pages = 0, .used_ppx = 0, .raster_count = 0, .shape_count = 0 };
+    pub fn atlasStats() struct { pages: u32, rgba_pages: u32, used_ppx: u64, raster_count: u64, shape_count: u64 } {
+        return .{
+            .pages = atlas_pages,
+            .rgba_pages = atlas_rgba_pages,
+            .used_ppx = atlas_used_ppx,
+            .raster_count = atlas_raster_count,
+            .shape_count = atlas_shape_count,
+        };
     }
 };
 

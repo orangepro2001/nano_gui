@@ -4,6 +4,10 @@
 const std = @import("std");
 const core = @import("core.zig");
 const theme = @import("theme.zig");
+const builtin = @import("builtin");
+
+/// 测试：强制走“发布构建”的非法 grow 权重恢复路径。
+pub var test_force_soft_grow_weight: bool = false;
 
 pub const unbounded: i32 = 1 << 28;
 
@@ -51,6 +55,8 @@ pub const ScrollParams = struct {
     bar_v: BarPolicy = .auto,
     bar_h: BarPolicy = .auto,
     offset: core.Vec2 = .{ .x = 0, .y = 0 },
+    offset_px: ?[2]i64 = null,
+    virtual_extent_px: ?[2]i64 = null,
     anchor_end: bool = false,
     reveal: ?core.Rect = null,
 };
@@ -58,6 +64,8 @@ pub const ScrollParams = struct {
 pub const ScrollMetrics = struct {
     offset: core.Vec2,
     offset_px: struct { x: i32, y: i32 },
+    content_px: [2]i64 = .{ 0, 0 },
+    viewport_px: [2]i32 = .{ 0, 0 },
     max_offset: core.Vec2,
     viewport: core.Rect,
     content: core.Vec2,
@@ -89,7 +97,7 @@ pub const TableParams = struct {
 pub const FormParams = struct { label_max: f32 = 240, col_gap: theme.Gap = .md };
 
 pub const Side = enum { below, above, right, left };
-pub const Placement = struct { side: Side = .below, align_: Align = .start };
+pub const Placement = struct { side: Side = .below, align_: Align = .start, flip_cross: bool = false };
 pub const AnchorTarget = union(enum) { parent, rect: core.Rect };
 pub const AnchorBounds = enum { parent, root };
 pub const AnchorParams = struct {
@@ -122,19 +130,21 @@ pub const CustomLayout = struct {
 
 pub const MeasureCtx = struct {
     scale: f32,
+    ctx: ?*anyopaque = null,
+    child_count_fn: ?*const fn (ctx: *anyopaque) usize = null,
+    child_params_fn: ?*const fn (ctx: *anyopaque, index: usize) *const Params = null,
+    measure_child_fn: ?*const fn (ctx: *anyopaque, index: usize, limit: Limit) SizeI = null,
+
     pub fn childCount(self: *const MeasureCtx) usize {
-        _ = self;
+        if (self.ctx) |c| if (self.child_count_fn) |f| return f(c);
         return 0;
     }
     pub fn childParams(self: *const MeasureCtx, index: usize) *const Params {
-        _ = self;
-        _ = index;
-        return undefined;
+        if (self.ctx) |c| if (self.child_params_fn) |f| return f(c, index);
+        return &default_params;
     }
     pub fn measureChild(self: *MeasureCtx, index: usize, limit: Limit) SizeI {
-        _ = self;
-        _ = index;
-        _ = limit;
+        if (self.ctx) |c| if (self.measure_child_fn) |f| return f(c, index, limit);
         return .{};
     }
     pub fn px(self: *const MeasureCtx, lpx: f32) i32 {
@@ -145,31 +155,34 @@ pub const MeasureCtx = struct {
 
 pub const ArrangeCtx = struct {
     scale: f32,
+    ctx: ?*anyopaque = null,
+    child_count_fn: ?*const fn (ctx: *anyopaque) usize = null,
+    child_params_fn: ?*const fn (ctx: *anyopaque, index: usize) *const Params = null,
+    measure_child_fn: ?*const fn (ctx: *anyopaque, index: usize, limit: Limit) SizeI = null,
+    place_child_fn: ?*const fn (ctx: *anyopaque, index: usize, rect: core.RectI) void = null,
+
     pub fn childCount(self: *const ArrangeCtx) usize {
-        _ = self;
+        if (self.ctx) |c| if (self.child_count_fn) |f| return f(c);
         return 0;
     }
     pub fn childParams(self: *const ArrangeCtx, index: usize) *const Params {
-        _ = self;
-        _ = index;
-        return undefined;
+        if (self.ctx) |c| if (self.child_params_fn) |f| return f(c, index);
+        return &default_params;
     }
     pub fn measureChild(self: *ArrangeCtx, index: usize, limit: Limit) SizeI {
-        _ = self;
-        _ = index;
-        _ = limit;
+        if (self.ctx) |c| if (self.measure_child_fn) |f| return f(c, index, limit);
         return .{};
     }
     pub fn placeChild(self: *ArrangeCtx, index: usize, rect: core.RectI) void {
-        _ = self;
-        _ = index;
-        _ = rect;
+        if (self.ctx) |c| if (self.place_child_fn) |f| f(c, index, rect);
     }
     pub fn px(self: *const ArrangeCtx, lpx: f32) i32 {
         if (lpx == 0) return 0;
         return @max(1, @as(i32, @intFromFloat(@round(lpx * self.scale))));
     }
 };
+
+const default_params = Params{};
 
 pub const Params = struct {
     kind: Kind = .leaf,
@@ -180,6 +193,10 @@ pub const Params = struct {
     cross_min: f32 = 0,
     cross_max: f32 = std.math.inf(f32),
     padding: core.Insets = .{},
+    /// 发丝线边框数；内容区额外内缩 border × hairline（REQ-LAYOUT-056）。
+    border: u8 = 0,
+    /// 仅虚拟化容器子项：相对视口的位置（ppx；REQ-LAYOUT-054）。
+    virtual_pos_px: ?[2]i32 = null,
     gap: theme.Gap = .none,
     justify: Justify = .start,
     cross_align: Align = .start,
@@ -199,6 +216,8 @@ pub const ContainerOptions = struct {
     cross_min: f32 = 0,
     cross_max: f32 = std.math.inf(f32),
     padding: core.Insets = .{},
+    /// 发丝线边框数；内容区额外内缩 border × hairline（REQ-LAYOUT-056）。
+    border: u8 = 0,
     gap: theme.Gap = .none,
     justify: Justify = .start,
     cross_align: Align = .start,
@@ -219,7 +238,12 @@ pub const ItemOptions = struct {
 };
 
 pub fn quantizeWeight(weight: f32) u32 {
-    if (!(weight > 0)) return 0;
+    if (!(weight > 0)) {
+        if (builtin.optimize == .debug and !test_force_soft_grow_weight) {
+            std.debug.panic("grow 权重必须大于 0（REQ-LAYOUT-030）", .{});
+        }
+        return 0;
+    }
     const q = @round(weight * 1024.0);
     if (q < 1) return 1;
     if (q > 4_000_000_000.0) return 4_000_000_000;
@@ -243,7 +267,9 @@ pub fn apportion(scratch: std.mem.Allocator, total: i32, weights: []const u64, o
         sum += share;
     }
     var remainder: i64 = @as(i64, total) - sum;
-    const used = scratch.alloc(bool, out.len) catch @panic("nano_gui: layout scratch exhausted");
+    if (remainder <= 0) return;
+    var used_stack: [32]bool = undefined;
+    const used: []bool = if (out.len <= 32) used_stack[0..out.len] else (scratch.alloc(bool, out.len) catch @panic("nano_gui: layout scratch exhausted"));
     @memset(used, false);
     while (remainder > 0) {
         var best: ?usize = null;
@@ -275,30 +301,38 @@ fn clamp(v: i32, lo: i32, hi: i32) i32 {
 
 /// 线性容器主轴分配（REQ-LAYOUT-016 至 REQ-LAYOUT-019）。
 pub fn distribute(scratch: std.mem.Allocator, items: []const FlexItem, avail: i32, out: []i32) DistributeResult {
-    std.debug.assert(out.len == items.len);
+    std.debug.assert(out.len == items.len); // 调用方须提供与 items 等长的输出缓冲（REQ-LAYOUT-016）
     if (items.len == 0) return .{ .overflow = 0, .leftover = @max(0, avail) };
     var non_grow_sum: i64 = 0;
     var grow_min_sum: i64 = 0;
-    // 临时数组均取自调用方给的帧竞技场，不设子项数上限（REQ-ARCH-011）。
+    var has_grow = false;
+    // 临时数组均取自栈或调用方给的帧竞技场，不设子项数上限（REQ-ARCH-011）。
     const n_items = items.len;
-    const b = scratch.alloc(i32, n_items) catch @panic("nano_gui: layout scratch exhausted");
-    const weights = scratch.alloc(u64, n_items) catch @panic("nano_gui: layout scratch exhausted");
-    const shares = scratch.alloc(i32, n_items) catch @panic("nano_gui: layout scratch exhausted");
-    const flags = scratch.alloc(bool, n_items) catch @panic("nano_gui: layout scratch exhausted");
-    const ideal = scratch.alloc(i64, n_items) catch @panic("nano_gui: layout scratch exhausted");
+    var b_stack: [32]i32 = undefined;
+    var w_stack: [32]u64 = undefined;
+    var s_stack: [32]i32 = undefined;
+    var f_stack: [32]bool = undefined;
+    var i_stack: [32]i64 = undefined;
+    const b: []i32 = if (n_items <= 32) b_stack[0..n_items] else (scratch.alloc(i32, n_items) catch @panic("nano_gui: layout scratch exhausted"));
     for (items, 0..) |it, i| {
         if (it.kind == .grow) {
+            has_grow = true;
             b[i] = it.min;
             grow_min_sum += it.min;
         } else {
             b[i] = clamp(it.base, it.min, it.max);
             non_grow_sum += b[i];
         }
-    }
-    for (items, 0..) |_, i| {
         out[i] = b[i];
     }
     const overflow_i: i64 = non_grow_sum + grow_min_sum - avail;
+    if (!has_grow and overflow_i <= 0) {
+        return .{ .overflow = 0, .leftover = @intCast(@min(@as(i64, std.math.maxInt(i32)), -overflow_i)) };
+    }
+    const weights: []u64 = if (n_items <= 32) w_stack[0..n_items] else (scratch.alloc(u64, n_items) catch @panic("nano_gui: layout scratch exhausted"));
+    const shares: []i32 = if (n_items <= 32) s_stack[0..n_items] else (scratch.alloc(i32, n_items) catch @panic("nano_gui: layout scratch exhausted"));
+    const flags: []bool = if (n_items <= 32) f_stack[0..n_items] else (scratch.alloc(bool, n_items) catch @panic("nano_gui: layout scratch exhausted"));
+    const ideal: []i64 = if (n_items <= 32) i_stack[0..n_items] else (scratch.alloc(i64, n_items) catch @panic("nano_gui: layout scratch exhausted"));
     if (overflow_i > 0) {
         // grow 一律取 min（已如此），再收缩 fit_shrink。
         var total_slack: i64 = 0;
@@ -340,19 +374,21 @@ pub fn distribute(scratch: std.mem.Allocator, items: []const FlexItem, avail: i3
         return .{ .overflow = remain_overflow, .leftover = 0 };
     }
 
-    // 冻结法分配 grow。
-    var remaining: i64 = @as(i64, avail) - non_grow_sum;
+    // 冻结法分配 grow。零权重 grow 项取其 min，须先从可分配量中扣除。
+    var zero_grow_min: i64 = 0;
     const active = flags;
     @memset(active, false);
     for (items, 0..) |it, i| {
         if (it.kind == .grow) {
             if (it.wq == 0) {
                 out[i] = it.min;
+                zero_grow_min += it.min;
             } else {
                 active[i] = true;
             }
         }
     }
+    var remaining: i64 = @as(i64, avail) - non_grow_sum - zero_grow_min;
     var guard: usize = 0;
     while (guard <= items.len) : (guard += 1) {
         var wsum: u64 = 0;
@@ -417,7 +453,7 @@ pub fn distribute(scratch: std.mem.Allocator, items: []const FlexItem, avail: i3
 }
 
 pub fn solveColumns(scratch: std.mem.Allocator, cols: []const Column, header_widths: []const i32, inner_w: i32, definite: bool, gap: i32, scale: f32, out: []i32) void {
-    std.debug.assert(out.len == cols.len);
+    std.debug.assert(out.len == cols.len); // 调用方须提供与列定义等长的输出缓冲
     if (cols.len == 0) return;
     const items = scratch.alloc(FlexItem, cols.len) catch @panic("nano_gui: layout scratch exhausted");
     for (cols, 0..) |c, i| {
@@ -455,7 +491,7 @@ pub fn placeAnchored(anchor: core.RectI, size_in: SizeI, placement: Placement, g
     }
     var x: i32 = 0;
     var y: i32 = 0;
-    const tryPlace = struct {
+    const TryPlace = struct {
         fn pos(a: core.RectI, sz: SizeI, s: Side, al: Align, g: i32) struct { x: i32, y: i32 } {
             var px_: i32 = 0;
             var py_: i32 = 0;
@@ -510,8 +546,8 @@ pub fn placeAnchored(anchor: core.RectI, size_in: SizeI, placement: Placement, g
         .left => .right,
     };
     var chosen = placement.side;
-    if (!tryPlace.fits(anchor, .{ .w = w, .h = h }, placement.side, placement.align_, gap, bounds)) {
-        if (tryPlace.fits(anchor, .{ .w = w, .h = h }, flip, placement.align_, gap, bounds)) {
+    if (!TryPlace.fits(anchor, .{ .w = w, .h = h }, placement.side, placement.align_, gap, bounds)) {
+        if (TryPlace.fits(anchor, .{ .w = w, .h = h }, flip, placement.align_, gap, bounds)) {
             chosen = flip;
         } else {
             const below_space = bounds.bottom() - anchor.bottom() - gap;
@@ -524,10 +560,15 @@ pub fn placeAnchored(anchor: core.RectI, size_in: SizeI, placement: Placement, g
             };
         }
     }
-    const p = tryPlace.pos(anchor, .{ .w = w, .h = h }, chosen, placement.align_, gap);
+    const p = TryPlace.pos(anchor, .{ .w = w, .h = h }, chosen, placement.align_, gap);
     x = p.x;
     y = p.y;
     var clamped = false;
+    // 交叉轴翻转：below/above 横向越界时改为右缘对齐锚点（REQ-LAYOUT-043）。
+    if (placement.flip_cross and (chosen == .below or chosen == .above)) {
+        const cx = anchor.right() - w;
+        if ((x < bounds.x or x + w > bounds.right()) and cx >= bounds.x and cx + w <= bounds.right()) x = cx;
+    }
     switch (chosen) {
         .below, .above => {
             const nx = std.math.clamp(x, bounds.x, @max(bounds.x, bounds.right() - w));

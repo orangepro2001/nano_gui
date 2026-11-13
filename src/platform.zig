@@ -11,7 +11,7 @@ const builtin = @import("builtin");
 
 pub const backend_name: []const u8 = if (builtin.os.tag == .windows) "win32" else "headless";
 const is_windows = builtin.os.tag == .windows;
-const winapi = std.os.windows;
+const win32 = if (is_windows) @import("platform/win32.zig") else struct {};
 
 pub const CursorShape = enum {
     arrow,
@@ -210,7 +210,9 @@ pub const SystemMetrics = struct {
     double_click_size: Size2i = .{ .w = 4, .h = 4 },
     drag_size: Size2i = .{ .w = 4, .h = 4 },
     wheel_lines: ScrollAmount = .{ .lines = 3 },
-    wheel_chars: ScrollAmount = .{ .lines = 1 },
+    wheel_chars: ScrollAmount = .{ .lines = 3 },
+    key_repeat_delay_ms: u32 = 500,
+    key_repeat_interval_ms: u32 = 33,
     menu_show_delay_ms: u32 = 400,
     hover_time_ms: u32 = 400,
     hover_size: Size2i = .{ .w = 4, .h = 4 },
@@ -264,6 +266,9 @@ pub const SysColors = struct {
         return s;
     }
 };
+
+/// 无头/GLFW 后端的测试字体族名（REQ-PLAT-084、REQ-TEXT-037）。
+pub const headless_font_family: []const u8 = "NanoTestSans";
 
 pub const MessageFont = struct {
     family: []const u8 = "Segoe UI",
@@ -319,6 +324,26 @@ pub const DismissReason = enum {
 };
 
 pub const DropEffect = enum { none, copy, move, link };
+pub const DropEffects = packed struct { copy: bool = false, move: bool = false, link: bool = false };
+pub const DropFormats = packed struct { files: bool = false, text: bool = false };
+pub const Path = []const u8;
+pub const DataObject = struct { files: []const Path = &.{}, text: ?[]const u8 = null, custom: []const u8 = &.{} };
+pub const DragData = DataObject;
+pub const DropData = struct {
+    allocator: std.mem.Allocator,
+    files: []Path = &.{},
+    text: ?[]u8 = null,
+    pub fn deinit(self: *DropData) void {
+        for (self.files) |f| self.allocator.free(f);
+        if (self.files.len > 0) self.allocator.free(self.files);
+        if (self.text) |t| self.allocator.free(t);
+        self.* = .{ .allocator = self.allocator };
+    }
+};
+pub const TrayEventKind = enum { click, double_click, context_menu, balloon_clicked };
+pub const BalloonKind = enum { none, info, warning, @"error" };
+pub const IconPixels = struct { w: u32, h: u32, rgba: []const u8 };
+pub const IconSet = []const IconPixels;
 
 pub const Data = union(enum) {
     mouse_move: struct {
@@ -371,6 +396,11 @@ pub const Data = union(enum) {
     session_ended: struct { logoff: bool },
     system_changed: struct { what: SettingsChanged },
     popup_dismiss: struct { reason: DismissReason },
+    drag_enter: struct { formats: DropFormats, pos: Vec2i, effects_allowed: DropEffects },
+    drag_over: struct { pos: Vec2i, mods: Mods },
+    drag_leave,
+    drop: struct { data: DropData, pos: Vec2i },
+    tray: struct { id: u32, kind: TrayEventKind, screen_pos: Vec2i },
     power_resume,
     render_lost,
 };
@@ -397,6 +427,7 @@ pub const WindowOptions = struct {
     owner: ?*Window = null,
     state: WindowState = .normal,
     hidden: bool = false,
+    placement: ?WindowPlacement = null,
 };
 
 pub const PopupWindowKind = enum { menu, dropdown, tooltip };
@@ -417,6 +448,7 @@ pub const Window = struct {
     id: u32,
     title: []const u8 = "",
     client: Size2i = .{ .w = 800, .h = 600 },
+    min_client_size: core.Size = .{ .w = 0, .h = 0 },
     scale_value: f32 = 1.0,
     dpi: u32 = 96,
     visible: bool = true,
@@ -425,9 +457,31 @@ pub const Window = struct {
     popup: bool = false,
     popup_kind: PopupWindowKind = .menu,
     owner: ?*Window = null,
+    placement: WindowPlacement = .{},
+    ime_saved_context: ?*anyopaque = null,
+    drop_target: ?*anyopaque = null,
+    drop_effect: DropEffect = .none,
+    hdc: ?*anyopaque = null,
+    hglrc: ?*anyopaque = null,
+    gl_ready: bool = false,
+    nanovg_surface: bool = false,
+    gl_deinit_fn: ?*const fn (dc: *anyopaque, rc: *anyopaque) void = null,
+    gl_present_fn: ?*const fn (dc: *anyopaque, rc: *anyopaque, w: u32, h: u32, rgba: []const u8) bool = null,
     cursor: CursorShape = .arrow,
+    /// 已实际应用到系统的形状；`null` 表示尚未应用过（REQ-PLAT-037 去重用）。
+    cursor_applied: ?CursorShape = null,
     capture: bool = false,
-    hwnd: ?winapi.HWND = null,
+    /// 客户区逻辑尺寸（lpx）；DPI 变化时据此重算物理尺寸（REQ-PLAT-010）。
+    size_lpx: core.Size = .{ .w = 800, .h = 600 },
+    /// 窗口位置（屏幕 ppx）。
+    position: Vec2i = .{ .x = 0, .y = 0 },
+    /// 每轴滚轮累加器（REQ-PLAT-029）：下标为 `@intFromEnum(Axis)`。
+    wheel_acc: [2]i32 = .{ 0, 0 },
+    /// 系统嵌套模态循环的周期计时器是否在运行（REQ-PLAT-022）。
+    modal_timer_active: bool = false,
+    /// 是否处于由对话框/拖放产生的嵌套模态循环中且为被禁用的 owner（REQ-PLAT-025）。
+    modal_disabled: bool = false,
+    hwnd: ?*anyopaque = null,
     present_rgba: []const u8 = &.{},
     present_w: u32 = 0,
     present_h: u32 = 0,
@@ -455,41 +509,46 @@ pub const Window = struct {
     }
     pub fn setTitle(self: *Window, title: []const u8) void {
         self.title = title;
-        if (is_windows and !headless_state.force_headless) {
-            if (self.hwnd) |h| {
-                const z = std.unicode.utf8ToUtf16LeAllocZ(headless_state.gpa, title) catch return;
-                defer headless_state.gpa.free(z);
-                _ = w32.SetWindowTextW(h, z.ptr);
-            }
-        }
+        if (is_windows and !HeadlessState.force_headless) win32.setTitle(self, title);
     }
+    /// 当前客户区物理尺寸（ppx；最小化时为 0×0）。线程：界面线程。REQ-PLAT-012。
+    pub fn clientSize(self: *const Window) Size2i {
+        return self.client;
+    }
+    /// 设置客户区逻辑尺寸（lpx）：先按最小客户区钳制，再按当前 scale 换算为 ppx（REQ-PLAT-012、REQ-PLAT-013）。线程：界面线程。
     pub fn setClientSize(self: *Window, size: core.Size) void {
-        self.client = .{ .w = @intFromFloat(@round(size.w * self.scale_value)), .h = @intFromFloat(@round(size.h * self.scale_value)) };
+        self.size_lpx = .{ .w = @max(size.w, self.min_client_size.w), .h = @max(size.h, self.min_client_size.h) };
+        self.applyScaledClient();
         pushResize(self);
     }
+    /// 按逻辑尺寸与当前 scale 重算物理客户区；最小化时保持 0×0。
+    fn applyScaledClient(self: *Window) void {
+        if (self.minimized) return;
+        self.client = .{ .w = lpxToPpx(self.size_lpx.w, self.scale_value), .h = lpxToPpx(self.size_lpx.h, self.scale_value) };
+    }
     pub fn setPosition(self: *Window, p: Vec2i) void {
-        _ = self;
-        _ = p;
+        self.position = p;
     }
     pub fn show(self: *Window) void {
         self.visible = true;
-        if (is_windows and !headless_state.force_headless) {
-            if (self.hwnd) |h| _ = w32.ShowWindow(h, 5);
-        }
+        if (is_windows and !HeadlessState.force_headless) win32.showWindow(self, 5);
         pushVisibility(self);
     }
     pub fn hide(self: *Window) void {
         self.visible = false;
-        if (is_windows and !headless_state.force_headless) {
-            if (self.hwnd) |h| _ = w32.ShowWindow(h, 0);
-        }
+        if (is_windows and !HeadlessState.force_headless) win32.showWindow(self, 0);
         pushVisibility(self);
     }
     pub fn minimize(self: *Window) void {
+        if (self.minimized) return;
         self.minimized = true;
         self.visible = true;
-        if (is_windows and !headless_state.force_headless) {
-            if (self.hwnd) |h| _ = w32.ShowWindow(h, 6);
+        if (is_windows and !HeadlessState.force_headless) {
+            win32.showWindow(self, 6);
+        } else {
+            // 无头：最小化即客户区 0×0 且 state = minimized（REQ-PLAT-035）。
+            self.client = .{ .w = 0, .h = 0 };
+            pushResize(self);
         }
         pushVisibility(self);
     }
@@ -497,24 +556,32 @@ pub const Window = struct {
         self.minimized = false;
     }
     pub fn restore(self: *Window) void {
+        const was_minimized = self.minimized;
         self.minimized = false;
         self.visible = true;
-        if (is_windows and !headless_state.force_headless) {
-            if (self.hwnd) |h| _ = w32.ShowWindow(h, 9);
+        if (is_windows and !HeadlessState.force_headless) {
+            win32.showWindow(self, 9);
+        } else if (was_minimized) {
+            self.applyScaledClient();
+            pushResize(self);
         }
         pushVisibility(self);
     }
+    /// 设置最小客户区（lpx）；之后的 `setClientSize` 以它钳制（REQ-PLAT-013）。线程：界面线程。
     pub fn setMinClientSize(self: *Window, size: core.Size) void {
-        _ = self;
-        _ = size;
+        self.min_client_size = size;
     }
     pub fn setIcon(self: *Window, icon: anytype) void {
         _ = self;
         _ = icon;
     }
+    /// 设置客户区指针形状；与已应用的形状相同时不产生系统调用（REQ-PLAT-036、REQ-PLAT-037）。线程：界面线程。
     pub fn setCursor(self: *Window, shape: CursorShape) void {
         self.cursor = shape;
-        headless_state.cursor = shape;
+        HeadlessState.cursor = shape;
+        if (self.cursor_applied) |applied| if (applied == shape) return;
+        self.cursor_applied = shape;
+        HeadlessState.cursor_apply_count += 1;
     }
     pub fn setDarkTitleBar(self: *Window, dark: bool) !void {
         _ = self;
@@ -529,7 +596,7 @@ pub const Window = struct {
     }
     pub fn setCapture(self: *Window, on: bool) void {
         self.capture = on;
-        if (on) headless_state.captured_window = self else if (headless_state.captured_window == self) headless_state.captured_window = null;
+        if (on) HeadlessState.captured_window = self else if (HeadlessState.captured_window == self) HeadlessState.captured_window = null;
     }
     pub fn confirmClose(self: *Window) void {
         destroyWindow(self);
@@ -538,20 +605,40 @@ pub const Window = struct {
         _ = self;
     }
     pub fn setImeCaretRect(self: *Window, caret: RectI, exclude: ?RectI) void {
-        _ = self;
-        _ = caret;
-        _ = exclude;
+        if (is_windows and !HeadlessState.force_headless) {
+            win32.setImeCaret(self, caret, exclude);
+            return;
+        }
+        if (HeadlessState.ime_caret_rect != null and rectEql(HeadlessState.ime_caret_rect.?, caret) and
+            ((HeadlessState.ime_caret_exclude == null and exclude == null) or
+                (HeadlessState.ime_caret_exclude != null and exclude != null and rectEql(HeadlessState.ime_caret_exclude.?, exclude.?)))) return;
+        HeadlessState.ime_caret_rect = caret;
+        HeadlessState.ime_caret_exclude = exclude;
+        HeadlessState.ime_caret_calls += 1;
     }
     pub fn setImeEnabled(self: *Window, enabled: bool) void {
-        _ = self;
-        _ = enabled;
+        if (is_windows and !HeadlessState.force_headless) {
+            win32.setImeEnabled(self, enabled);
+            return;
+        }
+        HeadlessState.ime_enabled_calls += 1;
+        HeadlessState.ime_enabled = enabled;
+        if (!enabled and HeadlessState.ime_active) headlessCancelComposition();
     }
     pub fn commitComposition(self: *Window) void {
-        _ = self;
+        if (is_windows and !HeadlessState.force_headless) {
+            win32.commitComposition(self);
+            return;
+        }
+        if (!HeadlessState.ime_active) return;
+        const copy = HeadlessState.gpa.dupe(u8, HeadlessState.ime_text.items) catch return;
+        HeadlessState.ime_commit_count += 1;
+        HeadlessState.ime_active = false;
+        pushHeadlessImeEvent(.{ .ime_commit = copy });
+        pushHeadlessImeEvent(.ime_end);
     }
     pub fn setDropEffect(self: *Window, effect: DropEffect) void {
-        _ = self;
-        _ = effect;
+        self.drop_effect = effect;
     }
     pub fn getPlacement(self: *const Window) WindowPlacement {
         return .{ .normal_rect = .{ .x = 0, .y = 0, .w = self.client.w, .h = self.client.h }, .state = if (self.minimized) .minimized else .normal, .dpi = self.dpi };
@@ -560,7 +647,31 @@ pub const Window = struct {
 
 pub const FrameReason = enum { size, paint, timer, nested_modal };
 
-const headless_state = struct {
+/// 96 DPI 对应 scale = 1.0（REQ-PLAT-010）。
+const default_dpi: u32 = 96;
+/// `WHEEL_DELTA`：滚轮一格的原始增量（REQ-PLAT-029）。
+const wheel_delta: i32 = 120;
+/// 一秒的毫秒数。
+const ms_per_s: u64 = std.time.ms_per_s;
+
+/// 逻辑像素换算为物理像素（四舍五入）。
+fn lpxToPpx(v: f32, scale_value: f32) i32 {
+    return @intFromFloat(@round(v * scale_value));
+}
+
+/// 当前是否走 Win32 原生后端（非无头）。
+fn isNative() bool {
+    return is_windows and !HeadlessState.force_headless;
+}
+
+/// 无头/GLFW 后端的默认外观（REQ-PLAT-084）；Win32 后端沿用结构体默认值。
+fn defaultAppearance() SystemAppearance {
+    var a = SystemAppearance{};
+    if (!is_windows) a.message_font.family = headless_font_family;
+    return a;
+}
+
+const HeadlessState = struct {
     var gpa: std.mem.Allocator = std.heap.smp_allocator;
     var force_headless: bool = false;
     var initialized: bool = false;
@@ -573,192 +684,690 @@ const headless_state = struct {
     var captured_window: ?*Window = null;
     var clipboard_text: std.ArrayListUnmanaged(u8) = .empty;
     var metrics: SystemMetrics = .{};
-    var appearance: SystemAppearance = .{};
+    var appearance: SystemAppearance = defaultAppearance();
     var present_count: u64 = 0;
     var advance_frames: u64 = 0;
     var vsync_cycles: u64 = 0;
     var scale: f32 = 1.0;
+    var dpi: u32 = default_dpi;
+    var frame_depth: u32 = 0;
+    var frame_calls: u64 = 0;
+    var cursor_apply_count: u64 = 0;
+    var mouse_vanish: bool = false;
+    var pointer_hidden: bool = false;
+    var last_mouse_pos: ?Vec2i = null;
+    var system_query_count: u64 = 0;
+    var pending_high_surrogate: ?u16 = null;
+    var present_src: RectI = .{};
+    var session_allowed: ?bool = null;
+    var session_answers: usize = 0;
+    var power_pending: bool = false;
+    var file_dialog_paths: ?[]const []const u8 = null;
+    var font_choice: ?FontChoice = null;
+    var task_result: ?TaskResult = null;
+    var dialog_paths: std.ArrayListUnmanaged([]u8) = .empty;
+    var clipboard_seq: u32 = 0;
+    var clipboard_custom: std.AutoHashMapUnmanaged(u32, []u8) = .empty;
+    var clipboard_formats: std.ArrayListUnmanaged(struct { id: u32, name: []u8 }) = .empty;
+    var next_format_id: u32 = 1;
+    var ime_active: bool = false;
+    var ime_enabled: bool = true;
+    var ime_text: std.ArrayListUnmanaged(u8) = .empty;
+    var ime_caret_rect: ?RectI = null;
+    var ime_caret_exclude: ?RectI = null;
+    var ime_caret_calls: usize = 0;
+    var ime_cancel_count: usize = 0;
+    var ime_commit_count: usize = 0;
+    var ime_enabled_calls: usize = 0;
+    var min_size_changes: usize = 0;
+    var tray_entries: std.ArrayListUnmanaged(struct { id: u32, owner: *Window, tooltip: []u8 }) = .empty;
+    var tray_last_balloon: ?struct { id: u32, title: []u8, text: []u8, kind: BalloonKind } = null;
+    var win_tray_entries: std.ArrayListUnmanaged(WinTrayEntry) = .empty;
+    var taskbar_created_msg: u32 = 0;
 };
+
+pub const WinTrayEntry = struct { id: u32, owner: *Window, hicon: ?*anyopaque, tooltip: []u8 };
+
+pub fn headlessGpa() std.mem.Allocator {
+    return HeadlessState.gpa;
+}
+pub fn windowsSlice() []const *Window {
+    return HeadlessState.windows.items;
+}
+pub fn pushBackendEvent(w: *Window, time_ms: u64, data: Data) void {
+    HeadlessState.events.append(HeadlessState.gpa, .{ .window = w, .time_ms = time_ms, .data = data }) catch {};
+    HeadlessState.wake_flag.store(true, .release);
+}
+pub fn allocWindowId() u32 {
+    const id = HeadlessState.next_id;
+    HeadlessState.next_id += 1;
+    return id;
+}
+pub fn appendWindow(w: *Window) !void {
+    try HeadlessState.windows.append(HeadlessState.gpa, w);
+}
+pub fn setHeadlessImeActive(v: bool) void {
+    HeadlessState.ime_active = v;
+}
+pub fn ensureTaskbarCreatedMsg(msg: u32) void {
+    if (HeadlessState.taskbar_created_msg == 0) HeadlessState.taskbar_created_msg = msg;
+}
+pub fn taskbarCreatedMsg() u32 {
+    return HeadlessState.taskbar_created_msg;
+}
+pub fn appendWinTrayEntry(id: u32, owner: *Window, hicon: ?*anyopaque, tooltip: []const u8) !void {
+    const copy = try HeadlessState.gpa.dupe(u8, tooltip);
+    HeadlessState.win_tray_entries.append(HeadlessState.gpa, .{ .id = id, .owner = owner, .hicon = hicon, .tooltip = copy }) catch |err| {
+        HeadlessState.gpa.free(copy);
+        return err;
+    };
+}
+pub fn findWinTrayEntry(id: u32) ?*WinTrayEntry {
+    for (HeadlessState.win_tray_entries.items) |*e| if (e.id == id) return e;
+    return null;
+}
+pub fn updateWinTrayTooltip(e: *WinTrayEntry, tooltip: []const u8) !void {
+    const copy = try HeadlessState.gpa.dupe(u8, tooltip);
+    HeadlessState.gpa.free(e.tooltip);
+    e.tooltip = copy;
+}
+pub fn removeWinTrayEntry(id: u32) void {
+    var i: usize = 0;
+    while (i < HeadlessState.win_tray_entries.items.len) {
+        if (HeadlessState.win_tray_entries.items[i].id == id) {
+            HeadlessState.gpa.free(HeadlessState.win_tray_entries.items[i].tooltip);
+            _ = HeadlessState.win_tray_entries.swapRemove(i);
+            return;
+        }
+        i += 1;
+    }
+}
+pub fn winTrayEntriesSlice() []const WinTrayEntry {
+    return HeadlessState.win_tray_entries.items;
+}
+pub fn dialogPathsSlice() []const Path {
+    return HeadlessState.dialog_paths.items;
+}
 
 pub const Headless = struct {
     pub fn injectMouseMove(pos: Vec2i, mods: Mods) void {
+        // 鼠标移动（坐标变化）使"键入时隐藏"的指针恢复（REQ-PLAT-037）。
+        if (HeadlessState.last_mouse_pos == null or HeadlessState.last_mouse_pos.?.x != pos.x or HeadlessState.last_mouse_pos.?.y != pos.y) {
+            HeadlessState.pointer_hidden = false;
+        }
+        HeadlessState.last_mouse_pos = pos;
         injectWindow(headlessRoot(), .{ .mouse_move = .{ .pos = pos, .mods = mods } });
     }
     pub fn injectMouseButton(button: MouseButton, down: bool, pos: Vec2i, mods: Mods) void {
-        injectWindow(headlessRoot(), .{ .mouse_button = .{ .button = button, .down = down, .pos = pos, .mods = mods } });
+        const w = headlessRoot();
+        injectWindow(w, .{ .mouse_button = .{ .button = button, .down = down, .pos = pos, .mods = mods } });
+        if (down and button == .left) {
+            HeadlessState.captured_window = w;
+            w.capture = true;
+        } else if (!down and button == .left) {
+            HeadlessState.captured_window = null;
+            w.capture = false;
+            const inside = pos.x >= 0 and pos.y >= 0 and pos.x < w.client.w and pos.y < w.client.h;
+            if (!inside) injectWindow(w, .mouse_leave);
+        }
     }
     pub fn injectWheel(dy: f32, pos: Vec2i, mods: Mods) void {
-        const raw: i32 = @intFromFloat(@round(dy * 120.0));
-        injectWindow(headlessRoot(), .{ .wheel = .{ .axis = .vertical, .raw = raw, .steps = @divTrunc(raw, 120), .pos = pos, .mods = mods } });
+        const raw: i32 = @intFromFloat(@round(dy * @as(f32, @floatFromInt(wheel_delta))));
+        injectWheelRaw(.vertical, raw, pos, mods);
+    }
+    /// 注入一个滚轮原始增量（1/120 格为单位）；`steps` 由该窗口该轴的累加器给出（REQ-PLAT-029）。线程：界面线程。
+    pub fn injectWheelRaw(axis: Axis, raw: i32, pos: Vec2i, mods: Mods) void {
+        const w = headlessRoot();
+        const steps = accumulateWheel(&w.wheel_acc[@backingInt(axis)], raw);
+        injectWindow(w, .{ .wheel = .{ .axis = axis, .raw = raw, .steps = steps, .pos = pos, .mods = mods } });
     }
     pub fn injectKey(vk: VirtualKey, down: bool, repeat: bool, mods: Mods) void {
-        injectWindow(headlessRoot(), .{ .key = .{ .vk = vk, .down = down, .repeat = repeat, .mods = mods } });
+        inject(.{ .key = .{ .vk = vk, .down = down, .repeat = repeat, .mods = mods } });
     }
     pub fn injectText(text: []const u8) void {
-        const copy = headless_state.gpa.dupe(u8, text) catch return;
+        const copy = HeadlessState.gpa.dupe(u8, text) catch return;
+        noteTextEvent();
         injectWindow(headlessRoot(), .{ .text = copy });
     }
+    /// 模拟一条 `WM_CHAR`（一个 UTF-16 单元）：代理对合并、孤立代理项丢弃并记一条 debug 日志、
+    /// 控制字符不产生 `text` 事件（REQ-PLAT-032）。线程：界面线程。
+    pub fn injectChar(unit: u16) void {
+        const pending = HeadlessState.pending_high_surrogate;
+        HeadlessState.pending_high_surrogate = null;
+        if (isHighSurrogate(unit)) {
+            if (pending) |p| logLoneSurrogate(p);
+            HeadlessState.pending_high_surrogate = unit;
+            return;
+        }
+        if (isLowSurrogate(unit)) {
+            if (pending) |p| {
+                const cp: u21 = @intCast(0x10000 + ((@as(u32, p) - 0xD800) << 10) + (@as(u32, unit) - 0xDC00));
+                emitCodepoint(cp);
+            } else logLoneSurrogate(unit);
+            return;
+        }
+        if (pending) |p| logLoneSurrogate(p);
+        if (unit < 0x20 or unit == 0x7F) return;
+        emitCodepoint(unit);
+    }
+    /// 设置系统"键入时隐藏指针"（`SPI_GETMOUSEVANISH`）桩值（REQ-PLAT-037）。
+    pub fn setMouseVanish(on: bool) void {
+        HeadlessState.mouse_vanish = on;
+    }
+    /// 指针当前是否因"键入时隐藏"而被隐藏。
+    pub fn pointerHidden() bool {
+        return HeadlessState.pointer_hidden;
+    }
+    /// 实际应用形状到系统的次数（相同形状重复设置不计，REQ-PLAT-037）。
+    pub fn cursorApplyCount() u64 {
+        return HeadlessState.cursor_apply_count;
+    }
+    /// 后端读取系统度量/外观的次数（初始化与 `system_changed` 重读计数；帧内读取不计，REQ-PLAT-040）。
+    pub fn systemQueryCount() u64 {
+        return HeadlessState.system_query_count;
+    }
     pub fn injectImeStart() void {
+        HeadlessState.ime_active = true;
+        HeadlessState.ime_text.clearRetainingCapacity();
         injectWindow(headlessRoot(), .ime_start);
     }
     pub fn injectImeUpdate(text: []const u8, cursor: usize) void {
-        const copy = headless_state.gpa.dupe(u8, text) catch return;
+        const copy = HeadlessState.gpa.dupe(u8, text) catch return;
+        HeadlessState.ime_text.clearRetainingCapacity();
+        HeadlessState.ime_text.appendSlice(HeadlessState.gpa, text) catch {};
+        HeadlessState.ime_active = true;
         injectWindow(headlessRoot(), .{ .ime_update = .{ .text = copy, .cursor = cursor, .segments = &.{} } });
     }
     pub fn injectImeCommit(text: []const u8) void {
-        const copy = headless_state.gpa.dupe(u8, text) catch return;
+        const copy = HeadlessState.gpa.dupe(u8, text) catch return;
         injectWindow(headlessRoot(), .{ .ime_commit = copy });
     }
     pub fn injectImeEnd() void {
+        HeadlessState.ime_active = false;
         injectWindow(headlessRoot(), .ime_end);
     }
     pub fn injectImeCancel() void {
-        injectWindow(headlessRoot(), .ime_end);
+        headlessCancelComposition();
     }
     pub fn inject(event: Data) void {
+        switch (event) {
+            .focus => |f| if (!f.gained) headlessCancelComposition(),
+            // `VK_PROCESSKEY` 的按键事件不得交给上层（REQ-PLAT-031）。
+            .key => |k| if (k.vk == .process_key) return,
+            else => {},
+        }
         injectWindow(headlessRoot(), event);
     }
+    pub fn imeCaretRect() ?RectI {
+        return HeadlessState.ime_caret_rect;
+    }
+    pub fn imeCaretExclude() ?RectI {
+        return HeadlessState.ime_caret_exclude;
+    }
+    pub fn imeCaretCalls() usize {
+        return HeadlessState.ime_caret_calls;
+    }
+    pub fn imeCancelCount() usize {
+        return HeadlessState.ime_cancel_count;
+    }
+    pub fn imeCommitCount() usize {
+        return HeadlessState.ime_commit_count;
+    }
+    pub fn imeEnabledCalls() usize {
+        return HeadlessState.ime_enabled_calls;
+    }
+    pub fn minSizeChanges() usize {
+        return HeadlessState.min_size_changes;
+    }
+    pub fn imeActive() bool {
+        return HeadlessState.ime_active;
+    }
+    pub fn injectTray(id: u32, kind: TrayEventKind, pos: Vec2i) void {
+        var owner = headlessRoot();
+        for (HeadlessState.tray_entries.items) |e| if (e.id == id) {
+            owner = e.owner;
+        };
+        injectWindow(owner, .{ .tray = .{ .id = id, .kind = kind, .screen_pos = pos } });
+    }
+    pub fn trayCount() usize {
+        return HeadlessState.tray_entries.items.len;
+    }
+    pub fn trayTooltip(id: u32) ?[]const u8 {
+        for (HeadlessState.tray_entries.items) |e| if (e.id == id) return e.tooltip;
+        return null;
+    }
+    pub fn trayBalloon() ?struct { id: u32, title: []const u8, text: []const u8, kind: BalloonKind } {
+        if (HeadlessState.tray_last_balloon) |b| return .{ .id = b.id, .title = b.title, .text = b.text, .kind = b.kind };
+        return null;
+    }
+    /// 两个系统恢复通知合并为一个事件（REQ-PLAT-088）。
+    pub fn injectPowerResume() void {
+        if (HeadlessState.power_pending) return;
+        HeadlessState.power_pending = true;
+        injectWindow(headlessRoot(), .power_resume);
+    }
     pub fn resize(w: i32, h: i32) void {
-        const win = headlessRoot();
-        win.client = .{ .w = w, .h = h };
+        resizeWindow(headlessRoot(), w, h);
+    }
+    /// 把指定窗口客户区设为 `w×h` ppx 并同步调用帧回调（`.size`）；0×0 即最小化（REQ-PLAT-022、REQ-PLAT-035）。线程：界面线程。
+    pub fn resizeWindow(win: *Window, w: i32, h: i32) void {
+        if (w == 0 and h == 0) {
+            win.minimized = true;
+            win.client = .{ .w = 0, .h = 0 };
+        } else {
+            win.minimized = false;
+            win.client = .{ .w = w, .h = h };
+            win.size_lpx = .{ .w = @as(f32, @floatFromInt(w)) / win.scale_value, .h = @as(f32, @floatFromInt(h)) / win.scale_value };
+        }
         pushResize(win);
+    }
+    /// 进入系统拖动/缩放循环：建立周期计时器（REQ-PLAT-022 第 3 条）。线程：界面线程。
+    pub fn simulateEnterSizeMove(win: *Window) void {
+        win.modal_timer_active = true;
+    }
+    /// 退出系统拖动/缩放循环：销毁计时器（REQ-PLAT-022 第 3 条）。线程：界面线程。
+    pub fn simulateExitSizeMove(win: *Window) void {
+        win.modal_timer_active = false;
+    }
+    /// 模拟 `WM_TIMER`：计时器在运行时同步调用帧回调（`.timer`）。线程：界面线程。
+    pub fn simulateTimer(win: *Window) void {
+        if (!win.modal_timer_active) return;
+        runFrame(win, .timer);
+    }
+    /// 模拟 `WM_PAINT`：产出 `repaint` 事件并同步调用帧回调（`.paint`，REQ-PLAT-022、REQ-PLAT-024）。线程：界面线程。
+    pub fn simulatePaint(win: *Window, rect: RectI) void {
+        injectWindow(win, .{ .repaint = .{ .rect = rect } });
+        runFrame(win, .paint);
+    }
+    /// 窗口的模态计时器计数（0 或 1）。
+    pub fn timerCount(win: *const Window) u32 {
+        return if (win.modal_timer_active) 1 else 0;
+    }
+    /// 模态计时器周期（ms）：`ceil(1000 / 刷新率)`，刷新率取窗口所在显示器（REQ-PLAT-022、REQ-PLAT-021）。
+    pub fn timerPeriodMs(win: *Window) u32 {
+        return framePeriodMs(monitorFromWindow(win).refresh_hz);
+    }
+    /// 当前帧回调的嵌套调用深度（回调外为 0）。
+    pub fn frameDepth() u32 {
+        return HeadlessState.frame_depth;
+    }
+    /// 帧回调被调用的总次数。
+    pub fn frameCallCount() u64 {
+        return HeadlessState.frame_calls;
+    }
+    /// 在帧后动作中启动对话框/拖放产生的嵌套模态循环（`reason = .nested_modal`，REQ-PLAT-025）：
+    /// 若此刻有帧在运行（深度不为 0）返回 `error.FrameReentry`；循环期间 owner 被禁用，输入事件不分发给它。
+    /// 线程：界面线程。
+    pub fn simulateNestedModal(owner: *Window, ctx: ?*anyopaque, body: *const fn (ctx: ?*anyopaque) void) error{FrameReentry}!void {
+        if (HeadlessState.frame_depth != 0) return error.FrameReentry;
+        owner.modal_disabled = true;
+        defer owner.modal_disabled = false;
+        body(ctx);
+    }
+    /// 嵌套模态循环内由 `WM_PAINT/WM_SIZE/WM_TIMER` 驱动一帧（REQ-PLAT-025）。线程：界面线程。
+    pub fn simulateNestedFrame(owner: *Window, reason: FrameReason) void {
+        runFrame(owner, reason);
+    }
+    /// 最近一次提交（`present`）所拷贝的源矩形（REQ-PLAT-024：整个客户区）。
+    pub fn lastPresentSource() RectI {
+        return HeadlessState.present_src;
     }
     pub fn setVisible(on: bool) void {
         headlessRoot().visible = on;
         pushVisibility(headlessRoot());
     }
     pub fn setActive(on: bool) void {
+        if (!on) HeadlessState.pointer_hidden = false;
         headlessRoot().active = on;
-        const e = Event{ .window = headlessRoot(), .time_ms = headless_state.now_ms, .data = .{ .activate = .{ .active = on } } };
-        headless_state.events.append(headless_state.gpa, e) catch {};
-        const f = Event{ .window = headlessRoot(), .time_ms = headless_state.now_ms, .data = .{ .focus = .{ .gained = on } } };
-        headless_state.events.append(headless_state.gpa, f) catch {};
+        const e = Event{ .window = headlessRoot(), .time_ms = HeadlessState.now_ms, .data = .{ .activate = .{ .active = on } } };
+        HeadlessState.events.append(HeadlessState.gpa, e) catch {};
+        const f = Event{ .window = headlessRoot(), .time_ms = HeadlessState.now_ms, .data = .{ .focus = .{ .gained = on } } };
+        HeadlessState.events.append(HeadlessState.gpa, f) catch {};
     }
+    /// 设置 DPI：此后新建窗口采用该 DPI；已有的首个窗口立即切换，产出 `dpi_changed` 与按逻辑尺寸重算的 `resized`
+    /// （REQ-PLAT-010、REQ-PLAT-012）。线程：界面线程。
     pub fn setDpi(dpi: u32) void {
-        const win = headlessRoot();
+        HeadlessState.dpi = dpi;
+        HeadlessState.scale = @as(f32, @floatFromInt(dpi)) / @as(f32, @floatFromInt(default_dpi));
+        if (HeadlessState.windows.items.len == 0) return;
+        setWindowDpi(HeadlessState.windows.items[0], dpi);
+    }
+    /// 设置指定窗口的 DPI（见 `setDpi`）。线程：界面线程。
+    pub fn setWindowDpi(win: *Window, dpi: u32) void {
         win.dpi = dpi;
-        win.scale_value = @as(f32, @floatFromInt(dpi)) / 96.0;
-        const e = Event{ .window = win, .time_ms = headless_state.now_ms, .data = .{ .dpi_changed = .{ .dpi = dpi, .scale = win.scale_value } } };
-        headless_state.events.append(headless_state.gpa, e) catch {};
+        win.scale_value = @as(f32, @floatFromInt(dpi)) / @as(f32, @floatFromInt(default_dpi));
+        const e = Event{ .window = win, .time_ms = HeadlessState.now_ms, .data = .{ .dpi_changed = .{ .dpi = dpi, .scale = win.scale_value } } };
+        HeadlessState.events.append(HeadlessState.gpa, e) catch {};
+        win.applyScaledClient();
+        pushResize(win);
     }
+    /// 注入系统度量变化：缓存先更新，再产出（同一轮合并的）`system_changed{metrics}`（REQ-PLAT-045、REQ-PLAT-046）。线程：界面线程。
     pub fn setMetrics(m: SystemMetrics) void {
-        headless_state.metrics = m;
-        headless_state.appearance.metrics = m;
+        HeadlessState.metrics = m;
+        HeadlessState.appearance.metrics = m;
+        HeadlessState.system_query_count += 1;
+        pushSystemChanged(.{ .metrics = true });
     }
+    /// 注入系统外观变化：缓存先更新，再按差异产出 `system_changed`（深浅/强调色/高对比度/系统颜色为 `appearance`，
+    /// 消息字体与文本大小为 `font`，度量为 `metrics`；无差异时按 `appearance`）。同一轮多次注入合并为一个事件。线程：界面线程。
     pub fn setAppearance(a: SystemAppearance) void {
-        headless_state.appearance = a;
-        headless_state.metrics = a.metrics;
+        const old = HeadlessState.appearance;
+        var what = SettingsChanged{};
+        what.appearance = old.apps_dark != a.apps_dark or !std.meta.eql(old.accent, a.accent) or
+            old.high_contrast != a.high_contrast or !std.meta.eql(old.sys_colors.map.values, a.sys_colors.map.values);
+        what.font = !messageFontEql(old.message_font, a.message_font) or old.text_scale != a.text_scale;
+        what.metrics = !std.meta.eql(old.metrics, a.metrics);
+        if (!what.appearance and !what.font and !what.metrics) what.appearance = true;
+        HeadlessState.appearance = a;
+        HeadlessState.metrics = a.metrics;
+        HeadlessState.system_query_count += 1;
+        pushSystemChanged(what);
+    }
+    /// 测试夹具可替换显示器配置（REQ-PLAT-014、AC-PLAT-008）。
+    /// 取不到刷新率（0）时按 60 Hz；`scale` 由 `dpi` 推出；变化时产出 `system_changed{display}`（REQ-PLAT-066）。线程：界面线程。
+    pub fn setMonitors(list: []const Monitor) void {
+        if (list.len == 0) return;
+        const n = @min(list.len, max_monitors);
+        for (list[0..n], 0..) |m, i| {
+            monitors_buf[i] = m;
+            if (m.refresh_hz == 0) monitors_buf[i].refresh_hz = fallback_refresh_hz;
+            if (m.dpi != 0) monitors_buf[i].scale = @as(f32, @floatFromInt(m.dpi)) / @as(f32, @floatFromInt(default_dpi));
+        }
+        monitors_len = n;
+        pushSystemChanged(.{ .display = true });
     }
     pub fn advanceMs(ms: u64) void {
-        headless_state.now_ms += ms;
+        HeadlessState.now_ms += ms;
     }
     /// 推进 n 个垂直同步周期；每周期 1000 / refresh_hz ms，按累计取整（REQ-PLAT-086、REQ-TEST-016）。
     pub fn vsync(n: u32) void {
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            headless_state.now_ms += peekVsyncPeriodMs();
+            HeadlessState.now_ms += peekVsyncPeriodMs();
             completeVsyncCycle();
         }
     }
     /// 下一个垂直同步周期的时长（ms）：第 k 周期为 floor((k+1)·1000/hz) − floor(k·1000/hz)，长期平均精确等于 1000/hz。
     pub fn peekVsyncPeriodMs() u64 {
-        const hz: u64 = if (monitors_buf[0].refresh_hz > 0) monitors_buf[0].refresh_hz else 60;
-        const k = headless_state.vsync_cycles;
+        const hz: u64 = if (monitors_buf[0].refresh_hz > 0) monitors_buf[0].refresh_hz else fallback_refresh_hz;
+        const k = HeadlessState.vsync_cycles;
         return (k + 1) * 1000 / hz - k * 1000 / hz;
     }
     /// 记一次垂直同步周期结束（不推进时钟）；供已自行推进时钟的回放运行器使用。
     pub fn completeVsyncCycle() void {
-        headless_state.vsync_cycles += 1;
-        headless_state.advance_frames += 1;
+        HeadlessState.vsync_cycles += 1;
+        HeadlessState.advance_frames += 1;
     }
     pub fn presentCount() u64 {
-        return headless_state.present_count;
+        return HeadlessState.present_count;
+    }
+    pub fn lastSessionAllowed() ?bool {
+        return HeadlessState.session_allowed;
+    }
+    pub fn sessionAnswerCount() usize {
+        return HeadlessState.session_answers;
+    }
+    pub fn windowCount() usize {
+        return HeadlessState.windows.items.len;
+    }
+    pub fn setFileDialogResult(paths: ?[]const []const u8) void {
+        HeadlessState.file_dialog_paths = paths;
+    }
+    pub fn setFontChoice(f: ?FontChoice) void {
+        HeadlessState.font_choice = f;
+    }
+    pub fn setTaskResult(t: ?TaskResult) void {
+        HeadlessState.task_result = t;
     }
     pub fn cursorShape() CursorShape {
-        return headless_state.cursor;
+        return HeadlessState.cursor;
     }
     pub fn captured() ?*Window {
-        return headless_state.captured_window;
+        return HeadlessState.captured_window;
     }
     pub fn popupRects() []const RectI {
         return &.{};
     }
     pub fn nowMs() u64 {
-        return headless_state.now_ms;
+        return HeadlessState.now_ms;
     }
     pub fn frameCount() u64 {
-        return headless_state.advance_frames;
+        return HeadlessState.advance_frames;
     }
 };
 
 fn headlessRoot() *Window {
-    if (headless_state.windows.items.len == 0) {
+    if (HeadlessState.windows.items.len == 0) {
         const w = createWindow(.{}) catch @panic("headless window creation failed");
         return w;
     }
-    return headless_state.windows.items[0];
+    return HeadlessState.windows.items[0];
+}
+
+fn isInputEvent(data: Data) bool {
+    return switch (data) {
+        .mouse_move, .mouse_button, .wheel, .key, .text => true,
+        else => false,
+    };
+}
+
+fn messageFontEql(a: MessageFont, b: MessageFont) bool {
+    return std.mem.eql(u8, a.family, b.family) and a.size_lpx == b.size_lpx and a.weight == b.weight and a.italic == b.italic;
+}
+
+fn mergeSettings(a: SettingsChanged, b: SettingsChanged) SettingsChanged {
+    const Bits = @typeInfo(SettingsChanged).@"struct".backing_integer.?;
+    return @bitCast(@as(Bits, @bitCast(a)) | @as(Bits, @bitCast(b)));
+}
+
+/// 产出 `system_changed`；队列中已有尚未投递的同类事件时合并为一个（位或，REQ-PLAT-045）。
+fn pushSystemChanged(what: SettingsChanged) void {
+    if (HeadlessState.windows.items.len == 0) return;
+    injectWindow(HeadlessState.windows.items[0], .{ .system_changed = .{ .what = what } });
+}
+
+/// 一个滚轮累加器吸收 `raw`，返回本次产生的整数格数（向零取整，余数保留；方向反转先清零，REQ-PLAT-029）。线程：界面线程。
+pub fn accumulateWheel(acc: *i32, raw: i32) i32 {
+    if (raw != 0 and acc.* != 0 and (acc.* < 0) != (raw < 0)) acc.* = 0;
+    acc.* += raw;
+    const steps = @divTrunc(acc.*, wheel_delta);
+    acc.* -= steps * wheel_delta;
+    return steps;
+}
+
+/// 等待一帧所用的周期（ms）：`ceil(1000 / 刷新率)`，刷新率为 0 时按 60 Hz（REQ-PLAT-021）。线程安全。
+pub fn framePeriodMs(refresh_hz: u32) u32 {
+    const hz: u32 = if (refresh_hz == 0) fallback_refresh_hz else refresh_hz;
+    return @intCast((ms_per_s + hz - 1) / hz);
+}
+
+fn isHighSurrogate(u: u16) bool {
+    return u >= 0xD800 and u <= 0xDBFF;
+}
+
+fn isLowSurrogate(u: u16) bool {
+    return u >= 0xDC00 and u <= 0xDFFF;
+}
+
+fn logLoneSurrogate(u: u16) void {
+    core.log.scoped(.platform).debug("丢弃孤立代理项 U+{X:0>4}", .{u});
+}
+
+/// 产出 `text` 事件前的平台层副作用："键入时隐藏"指针（REQ-PLAT-037）。
+fn noteTextEvent() void {
+    if (HeadlessState.mouse_vanish) HeadlessState.pointer_hidden = true;
+}
+
+fn emitCodepoint(cp: u21) void {
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch return;
+    const copy = HeadlessState.gpa.dupe(u8, buf[0..n]) catch return;
+    noteTextEvent();
+    injectWindow(headlessRoot(), .{ .text = copy });
+}
+
+/// 同步调用窗口的帧回调并维护调用深度（REQ-PLAT-022）。
+fn runFrame(win: *Window, reason: FrameReason) void {
+    const cb = win.frame_callback orelse return;
+    HeadlessState.frame_depth += 1;
+    HeadlessState.frame_calls += 1;
+    defer HeadlessState.frame_depth -= 1;
+    cb(win, reason);
 }
 
 fn injectWindow(win: *Window, data: Data) void {
-    const e = Event{ .window = win, .time_ms = headless_state.now_ms, .data = data };
-    headless_state.events.append(headless_state.gpa, e) catch {};
-    headless_state.wake_flag.store(true, .release);
+    // 嵌套模态循环期间，输入事件不分发到被禁用的 owner（REQ-PLAT-025）。
+    if (win.modal_disabled and isInputEvent(data)) return;
+    if (data == .system_changed) {
+        for (HeadlessState.events.items) |*pending| {
+            if (pending.data == .system_changed) {
+                pending.data.system_changed.what = mergeSettings(pending.data.system_changed.what, data.system_changed.what);
+                return;
+            }
+        }
+    }
+    const e = Event{ .window = win, .time_ms = HeadlessState.now_ms, .data = data };
+    HeadlessState.events.append(HeadlessState.gpa, e) catch {};
+    HeadlessState.wake_flag.store(true, .release);
 }
 
 fn pushResize(win: *Window) void {
-    const e = Event{ .window = win, .time_ms = headless_state.now_ms, .data = .{ .resized = .{ .client = win.client, .state = if (win.minimized) .minimized else .normal } } };
-    headless_state.events.append(headless_state.gpa, e) catch {};
-    if (win.frame_callback) |cb| cb(win, .size);
+    const e = Event{ .window = win, .time_ms = HeadlessState.now_ms, .data = .{ .resized = .{ .client = win.client, .state = if (win.minimized) .minimized else .normal } } };
+    HeadlessState.events.append(HeadlessState.gpa, e) catch {};
+    runFrame(win, .size);
 }
 
 fn pushVisibility(win: *Window) void {
-    const e = Event{ .window = win, .time_ms = headless_state.now_ms, .data = .{ .visibility = .{ .visible = win.visible and !win.minimized } } };
-    headless_state.events.append(headless_state.gpa, e) catch {};
+    const e = Event{ .window = win, .time_ms = HeadlessState.now_ms, .data = .{ .visibility = .{ .visible = win.visible and !win.minimized } } };
+    HeadlessState.events.append(HeadlessState.gpa, e) catch {};
 }
 
 /// 测试夹具/回放运行器可强制使用 headless 后端（REQ-TEST-020）。
 pub fn forceHeadless() void {
-    headless_state.force_headless = true;
+    HeadlessState.force_headless = true;
 }
 
 pub fn init(allocator: std.mem.Allocator) !void {
-    if (headless_state.initialized) return;
-    if (is_windows and !headless_state.force_headless) w32Init();
-    headless_state.gpa = allocator;
-    headless_state.initialized = true;
-    headless_state.metrics = .{};
-    headless_state.appearance = .{};
-    headless_state.appearance.metrics = headless_state.metrics;
+    if (HeadlessState.initialized) return;
+    if (is_windows and !HeadlessState.force_headless) win32.init();
+    HeadlessState.gpa = allocator;
+    HeadlessState.initialized = true;
+    HeadlessState.metrics = .{};
+    HeadlessState.appearance = defaultAppearance();
+    HeadlessState.appearance.metrics = HeadlessState.metrics;
+    HeadlessState.now_ms = 0;
+    HeadlessState.wake_flag.store(false, .release);
+    HeadlessState.scale = 1.0;
+    HeadlessState.dpi = default_dpi;
+    HeadlessState.frame_depth = 0;
+    HeadlessState.frame_calls = 0;
+    HeadlessState.cursor = .arrow;
+    HeadlessState.cursor_apply_count = 0;
+    HeadlessState.mouse_vanish = false;
+    HeadlessState.pointer_hidden = false;
+    HeadlessState.last_mouse_pos = null;
+    HeadlessState.pending_high_surrogate = null;
+    HeadlessState.captured_window = null;
+    HeadlessState.present_src = .{};
+    HeadlessState.present_count = 0;
+    HeadlessState.vsync_cycles = 0;
+    HeadlessState.advance_frames = 0;
+    HeadlessState.system_query_count = 1; // 初始化时一次性读取系统度量与外观（REQ-PLAT-040）。
+    injected_clock = null;
+    monitors_buf = default_monitors;
+    monitors_len = 1;
+    HeadlessState.dialog_paths = .empty;
+    HeadlessState.clipboard_seq = 0;
+    HeadlessState.clipboard_custom = .empty;
+    HeadlessState.clipboard_formats = .empty;
+    HeadlessState.next_format_id = 1;
+    HeadlessState.ime_active = false;
+    HeadlessState.ime_enabled = true;
+    HeadlessState.ime_text = .empty;
+    HeadlessState.ime_caret_rect = null;
+    HeadlessState.ime_caret_exclude = null;
+    HeadlessState.ime_caret_calls = 0;
+    HeadlessState.ime_cancel_count = 0;
+    HeadlessState.ime_commit_count = 0;
+    HeadlessState.ime_enabled_calls = 0;
+    HeadlessState.min_size_changes = 0;
+    HeadlessState.tray_entries = .empty;
+    HeadlessState.tray_last_balloon = null;
+    HeadlessState.win_tray_entries = .empty;
+    HeadlessState.taskbar_created_msg = 0;
+    HeadlessState.file_dialog_paths = null;
+    HeadlessState.font_choice = null;
+    HeadlessState.task_result = null;
+    HeadlessState.session_answers = 0;
+    HeadlessState.session_allowed = null;
 }
 
 pub fn deinit() void {
-    if (!headless_state.initialized) return;
-    headless_state.initialized = false;
-    for (headless_state.windows.items) |w| headless_state.gpa.destroy(w);
-    headless_state.windows.deinit(headless_state.gpa);
-    headless_state.windows = .empty;
-    headless_state.events.deinit(headless_state.gpa);
-    headless_state.events = .empty;
-    headless_state.clipboard_text.deinit(headless_state.gpa);
-    headless_state.clipboard_text = .empty;
+    if (!HeadlessState.initialized) return;
+    HeadlessState.initialized = false;
+    // 测试注入项不得泄漏到后续会话。
+    injected_clock = null;
+    monitors_buf = default_monitors;
+    monitors_len = 1;
+    HeadlessState.captured_window = null;
+    for (HeadlessState.windows.items) |w| HeadlessState.gpa.destroy(w);
+    HeadlessState.windows.deinit(HeadlessState.gpa);
+    HeadlessState.windows = .empty;
+    HeadlessState.events.deinit(HeadlessState.gpa);
+    HeadlessState.events = .empty;
+    HeadlessState.clipboard_text.deinit(HeadlessState.gpa);
+    HeadlessState.clipboard_text = .empty;
+    clearDialogPaths();
+    HeadlessState.dialog_paths.deinit(HeadlessState.gpa);
+    var cit = HeadlessState.clipboard_custom.valueIterator();
+    while (cit.next()) |v| HeadlessState.gpa.free(v.*);
+    HeadlessState.clipboard_custom.deinit(HeadlessState.gpa);
+    for (HeadlessState.clipboard_formats.items) |f| HeadlessState.gpa.free(f.name);
+    HeadlessState.clipboard_formats.deinit(HeadlessState.gpa);
+    HeadlessState.ime_text.deinit(HeadlessState.gpa);
+    for (HeadlessState.tray_entries.items) |e| HeadlessState.gpa.free(e.tooltip);
+    HeadlessState.tray_entries.deinit(HeadlessState.gpa);
+    if (HeadlessState.tray_last_balloon) |b| {
+        HeadlessState.gpa.free(b.title);
+        HeadlessState.gpa.free(b.text);
+    }
+    if (comptime is_windows) {
+        for (HeadlessState.win_tray_entries.items) |e| {
+            HeadlessState.gpa.free(e.tooltip);
+            if (e.hicon) |h| win32.destroyIcon(h);
+        }
+    }
+    HeadlessState.win_tray_entries.deinit(HeadlessState.gpa);
 }
 
 pub fn createWindow(opts: WindowOptions) !*Window {
-    if (is_windows and !headless_state.force_headless) return w32CreateWindow(opts);
-    const w = try headless_state.gpa.create(Window);
-    w.* = .{
-        .id = headless_state.next_id,
-        .title = opts.title,
-        .client = .{
-            .w = @intFromFloat(@round(opts.client_size.w)),
-            .h = @intFromFloat(@round(opts.client_size.h)),
-        },
-        .scale_value = headless_state.scale,
-        .dpi = @intFromFloat(headless_state.scale * 96.0),
-        .visible = !opts.hidden,
+    if (is_windows and !HeadlessState.force_headless) return win32.createWindow(opts);
+    const w = try HeadlessState.gpa.create(Window);
+    const clamped_lpx = core.Size{
+        .w = @max(opts.client_size.w, opts.min_client_size.w),
+        .h = @max(opts.client_size.h, opts.min_client_size.h),
     };
-    headless_state.next_id += 1;
-    try headless_state.windows.append(headless_state.gpa, w);
+    const scaled_client = Size2i{
+        .w = lpxToPpx(clamped_lpx.w, HeadlessState.scale),
+        .h = lpxToPpx(clamped_lpx.h, HeadlessState.scale),
+    };
+    w.* = .{
+        .id = HeadlessState.next_id,
+        .title = opts.title,
+        .client = scaled_client,
+        .size_lpx = clamped_lpx,
+        .min_client_size = opts.min_client_size,
+        .scale_value = HeadlessState.scale,
+        .dpi = @intFromFloat(HeadlessState.scale * 96.0),
+        .visible = !opts.hidden,
+        .placement = opts.placement orelse .{
+            .normal_rect = .{ .x = 0, .y = 0, .w = scaled_client.w, .h = scaled_client.h },
+            .state = opts.state,
+            .dpi = @intFromFloat(HeadlessState.scale * 96.0),
+        },
+    };
+    HeadlessState.next_id += 1;
+    try HeadlessState.windows.append(HeadlessState.gpa, w);
     return w;
 }
 
@@ -777,17 +1386,12 @@ pub fn createPopup(owner: *Window, spec: PopupWindowSpec) !*Window {
 }
 
 pub fn destroyWindow(w: *Window) void {
-    if (is_windows and !headless_state.force_headless) {
-        if (w.hwnd) |h| {
-            _ = w32.DestroyWindow(h);
-            w.hwnd = null;
-        }
-    }
-    for (headless_state.windows.items, 0..) |item, i| {
+    if (is_windows and !HeadlessState.force_headless) win32.destroyWindow(w);
+    for (HeadlessState.windows.items, 0..) |item, i| {
         if (item == w) {
-            _ = headless_state.windows.orderedRemove(i);
-            if (headless_state.captured_window == w) headless_state.captured_window = null;
-            headless_state.gpa.destroy(w);
+            _ = HeadlessState.windows.orderedRemove(i);
+            if (HeadlessState.captured_window == w) HeadlessState.captured_window = null;
+            HeadlessState.gpa.destroy(w);
             return;
         }
     }
@@ -803,49 +1407,71 @@ pub fn setFrameCallback(w: *Window, ctx: ?*anyopaque, cb: *const fn (w: *Window,
 }
 
 pub fn pumpMessages(sink: EventSink) usize {
-    if (is_windows and !headless_state.force_headless) _ = w32Pump();
+    HeadlessState.power_pending = false;
+    if (is_windows and !HeadlessState.force_headless) _ = win32.pump();
     var n: usize = 0;
-    while (headless_state.events.items.len > 0) {
-        const e = headless_state.events.orderedRemove(0);
+    while (HeadlessState.events.items.len > 0) {
+        const e = HeadlessState.events.orderedRemove(0);
         sink.func(sink.ctx, e);
         switch (e.data) {
-            .text => |t| headless_state.gpa.free(t),
-            .ime_commit => |t| headless_state.gpa.free(t),
+            .text => |t| HeadlessState.gpa.free(t),
+            .ime_commit => |t| HeadlessState.gpa.free(t),
             .ime_update => |u| {
-                headless_state.gpa.free(u.text);
-                headless_state.gpa.free(u.segments);
+                HeadlessState.gpa.free(u.text);
+                HeadlessState.gpa.free(u.segments);
             },
             else => {},
         }
         n += 1;
     }
-    _ = headless_state.wake_flag.swap(false, .acq_rel);
+    _ = HeadlessState.wake_flag.swap(false, .acq_rel);
     return n;
 }
 
 pub const WaitResult = enum { message, woken, timeout, idle };
 
 pub fn waitMessages(timeout_ms: ?u32) WaitResult {
-    if (is_windows and !headless_state.force_headless) return w32Wait(timeout_ms);
-    if (headless_state.events.items.len > 0) return .message;
-    if (headless_state.wake_flag.swap(false, .acq_rel)) return .woken;
+    if (is_windows and !HeadlessState.force_headless) return win32.wait(timeout_ms);
+    if (HeadlessState.events.items.len > 0) return .message;
+    if (HeadlessState.wake_flag.swap(false, .acq_rel)) return .woken;
     if (timeout_ms) |ms| {
         // 无头/假时钟：超时立即到达并推进注入时钟（AC-PLAT-012）。
-        if (injected_clock == null) headless_state.now_ms +%= ms;
+        if (injected_clock == null) HeadlessState.now_ms +%= ms;
         return .timeout;
     }
     return .idle;
 }
 
 pub fn wake() void {
-    headless_state.wake_flag.store(true, .release);
-    if (is_windows and !headless_state.force_headless) _ = w32.PostThreadMessageW(w32_thread_id, 0, 0, 0);
+    HeadlessState.wake_flag.store(true, .release);
+    if (is_windows and !HeadlessState.force_headless) win32.wake();
 }
 
+/// 平台单调时钟（ms，起点任意；注入的假时钟优先，无头默认为假时钟）。线程：界面线程。REQ-PLAT-038、REQ-PLAT-039。
 pub fn nowMs() u64 {
     if (injected_clock) |clock| return clock.now_ms(clock.ctx);
-    if (is_windows and !headless_state.force_headless) return w32Now();
-    return headless_state.now_ms;
+    if (is_windows and !HeadlessState.force_headless) return win32.nowMs();
+    return HeadlessState.now_ms;
+}
+
+/// 真实单调时钟（ms）：Win32 为 `QueryPerformanceCounter`，Linux 宿主为 `CLOCK_MONOTONIC`；与假时钟无关。
+/// 线程安全。REQ-PLAT-038。
+pub fn realNowMs() u64 {
+    switch (builtin.os.tag) {
+        .windows => return win32.nowMs(),
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+            const ns_per_ms: u64 = std.time.ns_per_ms;
+            return @as(u64, @intCast(ts.sec)) * ms_per_s + @as(u64, @intCast(ts.nsec)) / ns_per_ms;
+        },
+        else => @compileError("不支持的宿主：仅 Windows 与 Linux（开发宿主）"),
+    }
+}
+
+/// 时钟注入是否被允许：只允许无头模式或测试构建，发布构建的 Win32 后端不允许（REQ-PLAT-039）。
+pub fn clockInjectionAllowed(native_win32: bool, test_build: bool) bool {
+    return !native_win32 or test_build;
 }
 
 pub const Clock = struct {
@@ -855,20 +1481,30 @@ pub const Clock = struct {
 
 var injected_clock: ?Clock = null;
 
+/// 注入（或用 `null` 取消）时钟；发布构建的 Win32 后端返回 `error.Unsupported`（REQ-PLAT-039）。线程：界面线程。
 pub fn setClock(clock: ?Clock) !void {
+    if (!clockInjectionAllowed(isNative(), builtin.is_test)) return error.Unsupported;
     injected_clock = clock;
 }
 
+/// 通知平台层最小客户区（lpx）；仅值变化时记录一次。
+pub fn setMinSize(w: *Window, size: core.Size) void {
+    if (w.min_client_size.w == size.w and w.min_client_size.h == size.h) return;
+    w.min_client_size = size;
+    HeadlessState.min_size_changes += 1;
+}
+
 pub fn metrics(_: ?*Window) SystemMetrics {
-    return headless_state.metrics;
+    return HeadlessState.metrics;
 }
 
 pub fn appearance(_: ?*Window) SystemAppearance {
-    return headless_state.appearance;
+    return HeadlessState.appearance;
 }
 
+/// 全部显示器（虚拟屏幕物理像素）。线程：界面线程。REQ-PLAT-066。
 pub fn monitors() []const Monitor {
-    return monitors_buf[0..];
+    return monitors_buf[0..monitors_len];
 }
 
 pub const Monitor = struct {
@@ -881,57 +1517,525 @@ pub const Monitor = struct {
     primary: bool = true,
 };
 
-var monitors_buf: [1]Monitor = .{.{}};
+/// 无头后端可容纳的桩显示器数量上限。
+const max_monitors = 8;
+/// 无法取得刷新率时采用的值（REQ-PLAT-066、REQ-PLAT-021）。
+const fallback_refresh_hz: u32 = 60;
+const default_monitors: [max_monitors]Monitor = @splat(.{});
+var monitors_buf: [max_monitors]Monitor = default_monitors;
+var monitors_len: usize = 1;
 
 fn initMonitors() void {
-    headless_state.monitors = monitors_buf[0..];
+    _ = &monitors_buf;
 }
 
-pub fn monitorFromPoint(_: Vec2i) *const Monitor {
-    return &monitors_buf[0];
+/// 点到矩形的平方距离（点在矩形内为 0）。
+fn pointRectDistSq(p: Vec2i, r: RectI) i64 {
+    const dx: i64 = @max(@max(r.x - p.x, 0), p.x - (r.x + r.w - 1));
+    const dy: i64 = @max(@max(r.y - p.y, 0), p.y - (r.y + r.h - 1));
+    return dx * dx + dy * dy;
 }
 
-pub fn monitorFromWindow(_: *Window) *const Monitor {
-    return &monitors_buf[0];
+/// 返回包含该点的显示器；点在所有显示器之外时返回最近者（REQ-PLAT-066）。线程：界面线程。
+pub fn monitorFromPoint(p: Vec2i) *const Monitor {
+    var best: usize = 0;
+    var best_d: i64 = std.math.maxInt(i64);
+    for (monitors_buf[0..monitors_len], 0..) |m, i| {
+        const d = pointRectDistSq(p, m.bounds);
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return &monitors_buf[best];
+}
+
+/// 返回窗口中心点所在（或最近）的显示器（REQ-PLAT-066）。线程：界面线程。
+pub fn monitorFromWindow(w: *Window) *const Monitor {
+    return monitorFromPoint(.{ .x = w.position.x + @divTrunc(w.client.w, 2), .y = w.position.y + @divTrunc(w.client.h, 2) });
 }
 
 pub fn validatePlacement(p: WindowPlacement) WindowPlacement {
+    const caption_h: i32 = 23;
+    const min_caption_w: i32 = 30;
     var out = p;
-    out.normal_rect = .{
-        .x = std.math.clamp(p.normal_rect.x, 0, 1920 - 200),
-        .y = std.math.clamp(p.normal_rect.y, 0, 1040 - 100),
-        .w = std.math.clamp(p.normal_rect.w, 200, 1920),
-        .h = std.math.clamp(p.normal_rect.h, 100, 1040),
+    var target: ?*const Monitor = null;
+    var valid = false;
+    for (monitors_buf[0..monitors_len]) |*m| {
+        const wa = m.work_area;
+        const ix = @max(p.normal_rect.x, wa.x);
+        const iy = @max(p.normal_rect.y, wa.y);
+        const ix2 = @min(p.normal_rect.x +| p.normal_rect.w, wa.x + wa.w);
+        const iy2 = @min(p.normal_rect.y +| p.normal_rect.h, wa.y + wa.h);
+        const iw = @max(0, ix2 - ix);
+        const ih = @max(0, iy2 - iy);
+        const area = @as(i64, @max(0, p.normal_rect.w)) * @max(0, p.normal_rect.h);
+        const inter = @as(i64, iw) * ih;
+        const enough_area = area > 0 and inter * 4 >= area;
+        const title_y = p.normal_rect.y;
+        const title_in = title_y >= wa.y and title_y + caption_h <= wa.y + wa.h and
+            ix2 - ix >= min_caption_w;
+        if (enough_area and title_in) {
+            valid = true;
+            target = m;
+            break;
+        }
+        if (target == null) target = m;
+    }
+    const mon = target orelse {
+        out.dpi = 96;
+        return out;
     };
-    out.dpi = 96;
+    const cur_dpi = mon.dpi;
+    const saved_dpi: u32 = if (p.dpi == 0) 96 else p.dpi;
+    var w: i32 = p.normal_rect.w;
+    var h: i32 = p.normal_rect.h;
+    if (cur_dpi != saved_dpi) {
+        w = @intFromFloat(@round(@as(f64, @floatFromInt(p.normal_rect.w)) * @as(f64, @floatFromInt(cur_dpi)) / @as(f64, @floatFromInt(saved_dpi))));
+        h = @intFromFloat(@round(@as(f64, @floatFromInt(p.normal_rect.h)) * @as(f64, @floatFromInt(cur_dpi)) / @as(f64, @floatFromInt(saved_dpi))));
+    }
+    w = std.math.clamp(w, 1, mon.work_area.w);
+    h = std.math.clamp(h, 1, mon.work_area.h);
+    if (valid) {
+        out.normal_rect = .{
+            .x = std.math.clamp(p.normal_rect.x, mon.work_area.x, mon.work_area.x + mon.work_area.w - w),
+            .y = std.math.clamp(p.normal_rect.y, mon.work_area.y, mon.work_area.y + mon.work_area.h - h),
+            .w = w,
+            .h = h,
+        };
+    } else {
+        out.normal_rect = .{
+            .x = mon.work_area.x + 40,
+            .y = mon.work_area.y + 40,
+            .w = w,
+            .h = h,
+        };
+    }
+    out.dpi = cur_dpi;
     return out;
 }
 
-pub fn allowSessionEnd(_: bool) void {}
+pub fn allowSessionEnd(allowed: bool) void {
+    HeadlessState.session_allowed = allowed;
+    HeadlessState.session_answers += 1;
+}
 
 pub fn present(w: *Window) void {
-    headless_state.present_count += 1;
-    if (is_windows and !headless_state.force_headless) w32Present(w);
+    HeadlessState.present_count += 1;
+    // 提交拷贝的是整个渲染目标（即整个客户区），而非仅无效区（REQ-PLAT-024、REQ-GFX-005）。
+    HeadlessState.present_src = .{ .x = 0, .y = 0, .w = @intCast(w.present_w), .h = @intCast(w.present_h) };
+    if (is_windows and !HeadlessState.force_headless) win32.present(w);
+}
+
+/// UTF-16 转 UTF-8（REQ-PLAT-005）：孤立代理项转为 U+FFFD；调用方释放返回值。线程安全。
+pub fn utf16ToUtf8Alloc(allocator: std.mem.Allocator, text: []const u16) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const u = text[i];
+        var cp: u21 = u;
+        if (isHighSurrogate(u) and i + 1 < text.len and isLowSurrogate(text[i + 1])) {
+            cp = @intCast(0x10000 + ((@as(u32, u) - 0xD800) << 10) + (@as(u32, text[i + 1]) - 0xDC00));
+            i += 1;
+        } else if (isHighSurrogate(u) or isLowSurrogate(u)) {
+            cp = replacement_char;
+        }
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// U+FFFD 替换字符。
+pub const replacement_char: u21 = 0xFFFD;
+
+/// UTF-8 转 UTF-16（REQ-PLAT-005）：非法字节序列每字节转为 U+FFFD；调用方释放返回值。线程安全。
+pub fn utf8ToUtf16Alloc(allocator: std.mem.Allocator, text: []const u8) ![]u16 {
+    var out = std.ArrayListUnmanaged(u16).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            try out.append(allocator, replacement_char);
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) {
+            try out.append(allocator, replacement_char);
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            try out.append(allocator, replacement_char);
+            i += 1;
+            continue;
+        };
+        i += len;
+        if (cp >= 0x10000) {
+            const v: u32 = cp - 0x10000;
+            try out.append(allocator, @intCast(0xD800 + (v >> 10)));
+            try out.append(allocator, @intCast(0xDC00 + (v & 0x3FF)));
+        } else {
+            try out.append(allocator, @intCast(cp));
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// 长路径处理方式：由调用点选择（REQ-PLAT-005）。
+pub const LongPathMode = enum {
+    /// 超过 260 个单元时加 `\\?\` 前缀（仅限绝对路径）。
+    prefix,
+    /// 超过 260 个单元时返回 `error.PathTooLong`。
+    reject,
+};
+
+/// 传统路径长度上限（`MAX_PATH`，单元）。
+pub const max_path_units: usize = 260;
+/// 扩展长度路径的总长度上限（单元，含前缀）。
+pub const max_extended_path_units: usize = 32767;
+
+/// 把 UTF-8 路径转为以 0 结尾的 UTF-16 路径（REQ-PLAT-005）。超过 `max_path_units` 时按 `mode`
+/// 加 `\\?\` 前缀（UNC 为 `\\?\UNC\`，并把 `/` 换为 `\`）或返回 `error.PathTooLong`；
+/// 加前缀后总长超过 `max_extended_path_units` 或路径不是绝对路径同样返回 `error.PathTooLong`。调用方释放返回值。线程安全。
+pub fn pathToWide(allocator: std.mem.Allocator, utf8: []const u8, mode: LongPathMode) ![:0]u16 {
+    const wide = try utf8ToUtf16Alloc(allocator, utf8);
+    defer allocator.free(wide);
+    if (wide.len <= max_path_units) return dupeWideZ(allocator, wide);
+    if (mode == .reject) return error.PathTooLong;
+    const ext_prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\\\?\\");
+    const unc_prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\\\?\\UNC\\");
+    const sep = std.unicode.utf8ToUtf16LeStringLiteral("\\");
+    if (std.mem.startsWith(u16, wide, ext_prefix)) {
+        if (wide.len > max_extended_path_units) return error.PathTooLong;
+        return dupeWideZ(allocator, wide);
+    }
+    var head: []const u16 = undefined;
+    var rest: []const u16 = undefined;
+    const is_unc = wide.len >= 2 and isSeparator(wide[0]) and isSeparator(wide[1]);
+    const is_drive = wide.len >= 3 and wide[1] == ':' and isSeparator(wide[2]) and
+        ((wide[0] >= 'A' and wide[0] <= 'Z') or (wide[0] >= 'a' and wide[0] <= 'z'));
+    if (is_unc) {
+        head = unc_prefix;
+        rest = wide[2..];
+    } else if (is_drive) {
+        head = ext_prefix;
+        rest = wide;
+    } else return error.PathTooLong;
+    if (head.len + rest.len > max_extended_path_units) return error.PathTooLong;
+    var out = try allocator.allocSentinel(u16, head.len + rest.len, 0);
+    @memcpy(out[0..head.len], head);
+    for (rest, 0..) |c, i| out[head.len + i] = if (c == '/') sep[0] else c;
+    return out;
+}
+
+fn dupeWideZ(allocator: std.mem.Allocator, wide: []const u16) ![:0]u16 {
+    const out = try allocator.allocSentinel(u16, wide.len, 0);
+    @memcpy(out, wide);
+    return out;
+}
+
+fn isSeparator(u: u16) bool {
+    return u == '\\' or u == '/';
+}
+
+/// 由 `LOGFONT.lfHeight` 与取值所用 DPI 换算消息字体字号（lpx，REQ-PLAT-043）：
+/// 负值为字符高度；正值为单元高度，须减去内部行距 `internal_leading`（ppx）得字符高度。线程安全。
+pub fn messageFontSizeLpx(lf_height: i32, dpi: u32, internal_leading: i32) f32 {
+    const char_height: i32 = if (lf_height < 0) -lf_height else lf_height - internal_leading;
+    return @as(f32, @floatFromInt(char_height)) * @as(f32, @floatFromInt(default_dpi)) / @as(f32, @floatFromInt(dpi));
+}
+
+pub const FormatId = u32;
+pub const ClipItem = union(enum) {
+    text: []const u8,
+    data: struct { format: FormatId, bytes: []const u8 },
+};
+
+fn rectEql(a: RectI, b: RectI) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
+fn pushHeadlessImeEvent(data: Data) void {
+    const w = headlessRoot();
+    injectWindow(w, data);
+}
+
+fn headlessCancelComposition() void {
+    if (!HeadlessState.ime_active) return;
+    HeadlessState.ime_active = false;
+    HeadlessState.ime_cancel_count += 1;
+    HeadlessState.ime_text.clearRetainingCapacity();
+    pushHeadlessImeEvent(.ime_end);
+}
+
+pub const ImeAttr = enum(u8) { input = 0, target_converted = 1, converted = 2, target_unconverted = 3, input_error = 4, fixed_converted = 5 };
+
+/// 把 UTF-16 组字串与逐单元属性转换为 UTF-8 字节区间的段落（REQ-PLAT-052）。
+pub fn imeSegmentsFromUtf16(allocator: std.mem.Allocator, text: []const u16, attrs: []const u8) ![]ImeSegment {
+    var out = std.ArrayListUnmanaged(ImeSegment).empty;
+    errdefer out.deinit(allocator);
+    if (text.len == 0) return out.toOwnedSlice(allocator);
+    var byte_pos: usize = 0;
+    var run_start: usize = 0;
+    var run_style = styleOfAttr(attrs[0]);
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        const style = if (i < text.len) styleOfAttr(attrs[i]) else run_style;
+        if (i == text.len or style != run_style) {
+            try out.append(allocator, .{ .start = @intCast(run_start), .end = @intCast(byte_pos), .style = run_style });
+            run_start = byte_pos;
+            run_style = style;
+        }
+        if (i < text.len) {
+            var buf: [4]u8 = undefined;
+            const cp: u21 = if (text[i] >= 0xD800 and text[i] <= 0xDBFF and i + 1 < text.len and text[i + 1] >= 0xDC00 and text[i + 1] <= 0xDFFF)
+                @intCast(0x10000 + (@as(u32, text[i] - 0xD800) << 10) + (text[i + 1] - 0xDC00))
+            else if (text[i] >= 0xD800 and text[i] <= 0xDFFF) 0xFFFD else @intCast(text[i]);
+            const n = std.unicode.utf8Encode(cp, &buf) catch 1;
+            byte_pos += n;
+            if (cp >= 0x10000) i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn styleOfAttr(a: u8) ImeSegmentStyle {
+    return switch (a) {
+        1 => .target_converted,
+        2 => .converted,
+        3 => .target_unconverted,
+        4 => .@"error",
+        else => .unconverted,
+    };
 }
 
 pub const clipboard = struct {
+    fn normalizeLf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(allocator);
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '\r') {
+                if (i + 1 < text.len and text[i + 1] == '\n') i += 1;
+                try out.append(allocator, '\n');
+            } else try out.append(allocator, text[i]);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn toCrLf(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(allocator);
+        for (text) |c| {
+            if (c == '\n') try out.append(allocator, '\r');
+            try out.append(allocator, c);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn getText(allocator: std.mem.Allocator) !?[]u8 {
-        if (headless_state.clipboard_text.items.len == 0) return null;
-        return try allocator.dupe(u8, headless_state.clipboard_text.items);
+        if (is_windows and !HeadlessState.force_headless) {
+            const wide = try win32.clipboardGetText(allocator);
+            if (wide == null) return null;
+            defer allocator.free(wide.?);
+            return try normalizeLf(allocator, wide.?);
+        }
+        if (HeadlessState.clipboard_text.items.len == 0) return null;
+        return try normalizeLf(allocator, HeadlessState.clipboard_text.items);
     }
+
     pub fn setText(text: []const u8) !void {
-        headless_state.clipboard_text.clearRetainingCapacity();
-        try headless_state.clipboard_text.appendSlice(headless_state.gpa, text);
+        const normalized = try normalizeLf(HeadlessState.gpa, text);
+        defer HeadlessState.gpa.free(normalized);
+        if (is_windows and !HeadlessState.force_headless) {
+            const crlf = try toCrLf(HeadlessState.gpa, normalized);
+            defer HeadlessState.gpa.free(crlf);
+            return win32.clipboardSetText(crlf);
+        }
+        HeadlessState.clipboard_text.clearRetainingCapacity();
+        try HeadlessState.clipboard_text.appendSlice(HeadlessState.gpa, normalized);
+        HeadlessState.clipboard_seq +%= 1;
     }
+
+    pub fn registerFormat(name: []const u8) !FormatId {
+        for (HeadlessState.clipboard_formats.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.id;
+        }
+        const id = HeadlessState.next_format_id;
+        HeadlessState.next_format_id += 1;
+        const copy = try HeadlessState.gpa.dupe(u8, name);
+        try HeadlessState.clipboard_formats.append(HeadlessState.gpa, .{ .id = id, .name = copy });
+        return id;
+    }
+
+    fn setDataLocked(format: FormatId, bytes: []const u8) !void {
+        const copy = try HeadlessState.gpa.dupe(u8, bytes);
+        const gop = try HeadlessState.clipboard_custom.getOrPut(HeadlessState.gpa, format);
+        if (gop.found_existing) HeadlessState.gpa.free(gop.value_ptr.*);
+        gop.value_ptr.* = copy;
+    }
+
+    pub fn getData(format: FormatId, allocator: std.mem.Allocator) !?[]u8 {
+        const v = HeadlessState.clipboard_custom.get(format) orelse return null;
+        return try allocator.dupe(u8, v);
+    }
+
+    pub fn setData(format: FormatId, bytes: []const u8) !void {
+        try setDataLocked(format, bytes);
+        HeadlessState.clipboard_seq +%= 1;
+    }
+
+    /// 同一次写入中组合文本与自定义格式。
+    pub fn setMany(items: []const ClipItem) !void {
+        for (items) |item| switch (item) {
+            .text => |t| try setText(t),
+            .data => |d| try setDataLocked(d.format, d.bytes),
+        };
+        HeadlessState.clipboard_seq +%= 1;
+    }
+
     pub fn hasText() bool {
-        return headless_state.clipboard_text.items.len > 0;
+        if (is_windows and !HeadlessState.force_headless) return win32.clipboardHasText();
+        return HeadlessState.clipboard_text.items.len > 0;
     }
+
     pub fn sequenceNumber() u32 {
-        return @intCast(headless_state.clipboard_text.items.len);
+        if (is_windows and !HeadlessState.force_headless) return win32.clipboardSeq();
+        return HeadlessState.clipboard_seq;
     }
 };
 
+pub const FileDialogOptions = struct {
+    title: []const u8 = "",
+    multi: bool = false,
+    filters: []const []const u8 = &.{},
+    initial_dir: ?[]const u8 = null,
+    initial_name: ?[]const u8 = null,
+};
+pub const FontChoice = struct {
+    family: []const u8 = "Segoe UI",
+    size_lpx: f32 = 12,
+    weight: u16 = 400,
+    italic: bool = false,
+};
+pub const TaskDialogOptions = struct {
+    title: []const u8 = "",
+    instruction: []const u8 = "",
+    body: ?[]const u8 = null,
+    buttons: []const []const u8 = &.{},
+    default_button: ?u32 = null,
+    checkbox: ?[]const u8 = null,
+};
+pub const TaskResult = struct {
+    button: ?u32 = null,
+    checkbox_checked: bool = false,
+};
+
+pub const DropPayload = struct {
+    paths: []const []const u8 = &.{},
+    text: ?[]const u8 = null,
+};
+
+pub const DropTarget = struct {
+    allocator: std.mem.Allocator,
+    effect: DropEffect = .none,
+    paths: std.ArrayListUnmanaged([]u8) = .empty,
+    text: ?[]u8 = null,
+    out: ?[]const []const u8 = null,
+    truncated: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) DropTarget {
+        return .{ .allocator = allocator };
+    }
+    pub fn deinit(self: *DropTarget) void {
+        for (self.paths.items) |p| self.allocator.free(p);
+        self.paths.deinit(self.allocator);
+        if (self.text) |t| self.allocator.free(t);
+        if (self.out) |o| self.allocator.free(o);
+    }
+    /// IDropTarget::DragEnter：数据被接受前返回 none。
+    pub fn dragEnter(_: *DropTarget, _: []const []const u8, _: ?[]const u8) DropEffect {
+        return .none;
+    }
+    /// IDropTarget::DragOver：返回上层本帧声明的效果。
+    pub fn dragOver(self: *const DropTarget, _: Vec2i) DropEffect {
+        return self.effect;
+    }
+    pub fn setDropEffect(self: *DropTarget, effect: DropEffect) void {
+        self.effect = effect;
+    }
+    /// IDropTarget::Drop：在返回前深拷贝路径与文本。
+    pub fn drop(self: *DropTarget, paths: []const []const u8, text: ?[]const u8) !DropPayload {
+        for (self.paths.items) |p| self.allocator.free(p);
+        self.paths.clearRetainingCapacity();
+        if (self.text) |t| self.allocator.free(t);
+        self.text = null;
+        if (self.out) |o| self.allocator.free(o);
+        self.out = null;
+        const limit = @min(paths.len, 10_000);
+        self.truncated = paths.len > 10_000;
+        for (paths[0..limit]) |p| {
+            const copy = try self.allocator.dupe(u8, p);
+            try self.paths.append(self.allocator, copy);
+        }
+        if (text) |t| self.text = try self.allocator.dupe(u8, t);
+        const out_paths = try self.allocator.alloc([]const u8, self.paths.items.len);
+        for (self.paths.items, 0..) |p, i| out_paths[i] = p;
+        self.out = out_paths;
+        return .{ .paths = out_paths, .text = self.text };
+    }
+};
+
+pub fn clearDialogPaths() void {
+    for (HeadlessState.dialog_paths.items) |p| HeadlessState.gpa.free(p);
+    HeadlessState.dialog_paths.clearRetainingCapacity();
+}
+
+pub fn addDialogPathUtf16(slice: []const u16) !void {
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(HeadlessState.gpa, slice);
+    try HeadlessState.dialog_paths.append(HeadlessState.gpa, utf8);
+}
+
 pub const dialogs = struct {
+    pub fn openFileList(opts: FileDialogOptions) !?[]const Path {
+        if (is_windows and !HeadlessState.force_headless) return win32.fileDialog(opts, false);
+        if (HeadlessState.file_dialog_paths) |paths| return paths;
+        return error.Unsupported;
+    }
+    pub fn saveFilePath(opts: FileDialogOptions) !?Path {
+        if (is_windows and !HeadlessState.force_headless) {
+            const paths = try win32.fileDialog(opts, true);
+            return if (paths != null and paths.?.len > 0) paths.?[0] else null;
+        }
+        if (HeadlessState.file_dialog_paths) |paths| {
+            return if (paths.len > 0) paths[0] else null;
+        }
+        return error.Unsupported;
+    }
+
+    pub fn pickFolderPath() !?Path {
+        if (is_windows and !HeadlessState.force_headless) return win32.pickFolder(.{});
+        if (HeadlessState.file_dialog_paths) |paths| {
+            return if (paths.len > 0) paths[0] else null;
+        }
+        return error.Unsupported;
+    }
+
+    pub fn pickColorChoice(initial: core.Color) !?core.Color {
+        if (is_windows and !HeadlessState.force_headless) return win32.pickColor(initial);
+        return error.Unsupported;
+    }
+    pub fn pickFontChoice() !FontChoice {
+        if (HeadlessState.font_choice) |f| return f;
+        return error.Unsupported;
+    }
+    pub fn taskResult() !TaskResult {
+        if (HeadlessState.task_result) |t| return t;
+        return error.Unsupported;
+    }
     pub fn openFile(_: ?*Window, _: anytype) !?[]const u8 {
         return error.Unsupported;
     }
@@ -952,7 +2056,15 @@ pub const dialogs = struct {
     }
 };
 
+var in_build: bool = false;
+
+/// 由 `ui` 在构建期内设置；用于断言帧内阻塞调用（REQ-FRAME-027）。
+pub fn setInBuild(v: bool) void {
+    in_build = v;
+}
+
 pub fn messageBox(_: ?*Window, title: []const u8, text: []const u8, _: anytype) u32 {
+    std.debug.assert(!in_build); // 构建函数内不得调用阻塞对话框
     std.debug.print("{s}: {s}\n", .{ title, text });
     return 1;
 }
@@ -962,21 +2074,98 @@ pub fn fatal(title: []const u8, text: []const u8) noreturn {
     std.process.exit(1);
 }
 
-pub const uia = struct {
-    pub fn isEnabled() bool {
-        return false;
+pub const uia = @import("platform/uia.zig");
+
+/// 返回当前进程累计 CPU 时间（毫秒），供 `S-IDLE` 预算测量使用（REQ-PERF-010）。线程：线程安全。
+pub fn processCpuTimeMs() u64 {
+    if (comptime builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        const rc = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+        if (rc == 0) {
+            const sec_ms: u64 = @intCast(@max(0, ts.sec));
+            const nsec_ms: u64 = @intCast(@max(0, @divTrunc(ts.nsec, 1_000_000)));
+            return sec_ms * 1000 + nsec_ms;
+        }
+        return 0;
+    } else if (comptime is_windows) {
+        return win32.processCpuTimeMs();
     }
-};
+    return 0;
+}
 
 pub const tray = struct {
-    pub fn add(_: anytype) !u32 {
-        return error.Unsupported;
+    pub const Error = error{ Unsupported, PlatformFailed, OutOfMemory };
+
+    pub fn add(owner: *Window, id: u32, icon: IconSet, tooltip: []const u8) Error!void {
+        if (comptime is_windows) {
+            if (!HeadlessState.force_headless) return win32.trayAdd(owner, id, icon, tooltip);
+        }
+        const copy = HeadlessState.gpa.dupe(u8, tooltip) catch return error.OutOfMemory;
+        for (HeadlessState.tray_entries.items) |*e| {
+            if (e.id == id) {
+                HeadlessState.gpa.free(e.tooltip);
+                e.* = .{ .id = id, .owner = owner, .tooltip = copy };
+                return;
+            }
+        }
+        HeadlessState.tray_entries.append(HeadlessState.gpa, .{ .id = id, .owner = owner, .tooltip = copy }) catch return error.OutOfMemory;
     }
-    pub fn remove(_: u32) void {}
+
+    pub fn modify(id: u32, icon: ?IconSet, tooltip: ?[]const u8) Error!void {
+        if (comptime is_windows) {
+            if (!HeadlessState.force_headless) return win32.trayModify(id, icon, tooltip);
+        }
+        for (HeadlessState.tray_entries.items) |*e| {
+            if (e.id != id) continue;
+            if (tooltip) |t| {
+                const copy = HeadlessState.gpa.dupe(u8, t) catch return error.OutOfMemory;
+                HeadlessState.gpa.free(e.tooltip);
+                e.tooltip = copy;
+            }
+            return;
+        }
+        return error.PlatformFailed;
+    }
+
+    pub fn balloon(id: u32, title: []const u8, text: []const u8, kind: BalloonKind) Error!void {
+        if (comptime is_windows) {
+            if (!HeadlessState.force_headless) return win32.trayBalloon(id, title, text, kind);
+        }
+        const tcopy = HeadlessState.gpa.dupe(u8, title) catch return error.OutOfMemory;
+        const bcopy = HeadlessState.gpa.dupe(u8, text) catch {
+            HeadlessState.gpa.free(tcopy);
+            return error.OutOfMemory;
+        };
+        if (HeadlessState.tray_last_balloon) |old| {
+            HeadlessState.gpa.free(old.title);
+            HeadlessState.gpa.free(old.text);
+        }
+        HeadlessState.tray_last_balloon = .{ .id = id, .title = tcopy, .text = bcopy, .kind = kind };
+        return;
+    }
+
+    pub fn remove(id: u32) void {
+        if (comptime is_windows) {
+            if (!HeadlessState.force_headless) {
+                win32.trayRemove(id);
+                return;
+            }
+        }
+        var i: usize = 0;
+        while (i < HeadlessState.tray_entries.items.len) {
+            if (HeadlessState.tray_entries.items[i].id == id) {
+                HeadlessState.gpa.free(HeadlessState.tray_entries.items[i].tooltip);
+                _ = HeadlessState.tray_entries.swapRemove(i);
+                return;
+            }
+            i += 1;
+        }
+    }
 };
 
-pub fn startDrag(_: *Window, _: anytype, _: anytype) !DropEffect {
-    return error.Unsupported;
+pub fn startDrag(w: *Window, data: DragData, allowed: DropEffects) !DropEffect {
+    if (!is_windows or HeadlessState.force_headless) return error.Unsupported;
+    return win32.startDrag(w, data, allowed);
 }
 
 pub fn headless() type {
@@ -1003,301 +2192,44 @@ test "headless event injection" {
 }
 
 // ---------------------------------------------------------------------------
-// Win32 一等后端（编译期选择；Linux 构建不进入这些分支）
+// GLFW/无头降级矩阵（REQ-PLAT-083、REQ-PLAT-084）
 // ---------------------------------------------------------------------------
 
-const w32 = struct {
-    const WM_DESTROY: u32 = 0x0002;
-    const WM_CLOSE: u32 = 0x0010;
-    const WM_PAINT: u32 = 0x000F;
-    const WM_SIZE: u32 = 0x0005;
-    const WM_MOUSEMOVE: u32 = 0x0200;
-    const WM_LBUTTONDOWN: u32 = 0x0201;
-    const WM_LBUTTONUP: u32 = 0x0202;
-    const WM_RBUTTONDOWN: u32 = 0x0204;
-    const WM_RBUTTONUP: u32 = 0x0205;
-    const WM_MBUTTONDOWN: u32 = 0x0207;
-    const WM_MBUTTONUP: u32 = 0x0208;
-    const WM_MOUSEWHEEL: u32 = 0x020A;
-    const WM_KEYDOWN: u32 = 0x0100;
-    const WM_KEYUP: u32 = 0x0101;
-    const WM_SYSKEYDOWN: u32 = 0x0104;
-    const WM_SYSKEYUP: u32 = 0x0105;
-    const WM_CHAR: u32 = 0x0102;
-    const WM_SETFOCUS: u32 = 0x0007;
-    const WM_KILLFOCUS: u32 = 0x0008;
-    const WM_ACTIVATE: u32 = 0x0006;
-    const WM_ACTIVATEAPP: u32 = 0x001C;
-    const WM_DPICHANGED: u32 = 0x02E0;
-    const WM_GETMINMAXINFO: u32 = 0x0024;
-    const WM_SETCURSOR: u32 = 0x0020;
-    const WM_ERASEBKGND: u32 = 0x0014;
-    const WM_TIMER: u32 = 0x0113;
-    const PM_REMOVE: u32 = 1;
-    const QS_ALLINPUT: u32 = 0x04FF;
-    const MWMO_INPUTAVAILABLE: u32 = 0x0004;
-    const CW_USEDEFAULT: i32 = -2147483648;
-
-    const WNDCLASSW = extern struct {
-        style: u32 = 0,
-        lpfnWndProc: *const fn (winapi.HWND, u32, usize, isize) callconv(.winapi) isize = undefined,
-        cbClsExtra: i32 = 0,
-        cbWndExtra: i32 = 0,
-        hInstance: ?winapi.HINSTANCE = null,
-        hIcon: ?*anyopaque = null,
-        hCursor: ?*anyopaque = null,
-        hbrBackground: ?*anyopaque = null,
-        lpszMenuName: ?[*:0]const u16 = null,
-        lpszClassName: [*:0]const u16 = undefined,
-    };
-    const RECT = extern struct { left: i32 = 0, top: i32 = 0, right: i32 = 0, bottom: i32 = 0 };
-    const POINT = extern struct { x: i32 = 0, y: i32 = 0 };
-    const MSG = extern struct {
-        hwnd: ?winapi.HWND = null,
-        message: u32 = 0,
-        wParam: usize = 0,
-        lParam: isize = 0,
-        time: u32 = 0,
-        pt: POINT = .{},
-        lPrivate: u32 = 0,
-    };
-    const BITMAPINFOHEADER = extern struct {
-        biSize: u32 = @sizeOf(BITMAPINFOHEADER),
-        biWidth: i32 = 0,
-        biHeight: i32 = 0,
-        biPlanes: u16 = 1,
-        biBitCount: u16 = 32,
-        biCompression: u32 = 0,
-        biSizeImage: u32 = 0,
-        biXPelsPerMeter: i32 = 0,
-        biYPelsPerMeter: i32 = 0,
-        biClrUsed: u32 = 0,
-        biClrImportant: u32 = 0,
-    };
-    const BITMAPINFO = extern struct { bmiHeader: BITMAPINFOHEADER = .{}, bmiColors: [1]u32 = .{0} };
-    const PAINTSTRUCT = extern struct {
-        hdc: ?*anyopaque = null,
-        fErase: i32 = 0,
-        rcPaint: RECT = .{},
-        fRestore: i32 = 0,
-        fIncUpdate: i32 = 0,
-        rgbReserved: [32]u8 = @splat(0),
-    };
-    const MINMAXINFO = extern struct { ptReserved: POINT = .{}, ptMaxSize: POINT = .{}, ptMaxPosition: POINT = .{}, ptMinTrackSize: POINT = .{}, ptMaxTrackSize: POINT = .{} };
-
-    extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?winapi.HINSTANCE;
-    extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
-    extern "kernel32" fn QueryPerformanceCounter(v: *i64) callconv(.winapi) i32;
-    extern "kernel32" fn QueryPerformanceFrequency(v: *i64) callconv(.winapi) i32;
-    extern "user32" fn RegisterClassW(c: *const WNDCLASSW) callconv(.winapi) u16;
-    extern "user32" fn CreateWindowExW(ex: u32, class: [*:0]const u16, title: [*:0]const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: ?winapi.HWND, menu: ?*anyopaque, inst: ?winapi.HINSTANCE, param: ?*anyopaque) callconv(.winapi) ?winapi.HWND;
-    extern "user32" fn DefWindowProcW(h: winapi.HWND, m: u32, w: usize, l: isize) callconv(.winapi) isize;
-    extern "user32" fn DestroyWindow(h: winapi.HWND) callconv(.winapi) i32;
-    extern "user32" fn ShowWindow(h: winapi.HWND, cmd: i32) callconv(.winapi) i32;
-    extern "user32" fn UpdateWindow(h: winapi.HWND) callconv(.winapi) i32;
-    extern "user32" fn GetClientRect(h: winapi.HWND, r: *RECT) callconv(.winapi) i32;
-    extern "user32" fn GetWindowRect(h: winapi.HWND, r: *RECT) callconv(.winapi) i32;
-    extern "user32" fn AdjustWindowRectEx(r: *RECT, style: u32, menu: i32, ex: u32) callconv(.winapi) i32;
-    extern "user32" fn GetDpiForWindow(h: winapi.HWND) callconv(.winapi) u32;
-    extern "user32" fn PeekMessageW(m: *MSG, h: ?winapi.HWND, min: u32, max: u32, remove: u32) callconv(.winapi) i32;
-    extern "user32" fn TranslateMessage(m: *const MSG) callconv(.winapi) i32;
-    extern "user32" fn DispatchMessageW(m: *const MSG) callconv(.winapi) isize;
-    extern "user32" fn MsgWaitForMultipleObjectsEx(count: u32, handles: ?*const anyopaque, ms: u32, wake: u32, flags: u32) callconv(.winapi) u32;
-    extern "user32" fn PostThreadMessageW(id: u32, msg: u32, w: usize, l: isize) callconv(.winapi) i32;
-    extern "user32" fn GetKeyState(vk: i32) callconv(.winapi) i16;
-    extern "user32" fn ScreenToClient(h: winapi.HWND, p: *POINT) callconv(.winapi) i32;
-    extern "user32" fn BeginPaint(h: winapi.HWND, ps: *PAINTSTRUCT) callconv(.winapi) ?*anyopaque;
-    extern "user32" fn EndPaint(h: winapi.HWND, ps: *const PAINTSTRUCT) callconv(.winapi) i32;
-    extern "user32" fn SetWindowTextW(h: winapi.HWND, text: [*:0]const u16) callconv(.winapi) i32;
-    extern "user32" fn GetDC(h: winapi.HWND) callconv(.winapi) ?*anyopaque;
-    extern "user32" fn ReleaseDC(h: winapi.HWND, dc: ?*anyopaque) callconv(.winapi) i32;
-    extern "user32" fn SetCursor(c: ?*anyopaque) callconv(.winapi) ?*anyopaque;
-    extern "user32" fn LoadCursorW(inst: ?winapi.HINSTANCE, name: usize) callconv(.winapi) ?*anyopaque;
-    extern "gdi32" fn SetDIBitsToDevice(dc: ?*anyopaque, x: i32, y: i32, w: u32, h: u32, sx: i32, sy: i32, start: u32, lines: u32, bits: *const anyopaque, bmi: *const BITMAPINFO, usage: u32) callconv(.winapi) i32;
+pub const Capability = enum {
+    process_init,
+    window_creation,
+    per_window_scale,
+    dark_title_bar,
+    placement,
+    close_request,
+    session_power,
+    message_loop,
+    nested_frame,
+    mouse_key,
+    mouse_capture,
+    keyboard_text,
+    ime,
+    cursor_shape,
+    clock,
+    metrics,
+    appearance,
+    clipboard,
+    dialogs,
+    ole_drop,
+    tray,
+    monitors,
+    popup_window,
+    gl_context,
+    vsync,
+    context_loss,
 };
 
-var w32_class_registered: bool = false;
-var w32_instance: ?winapi.HINSTANCE = null;
-var w32_thread_id: u32 = 0;
-var w32_qpc_freq: i64 = 0;
+pub const Support = enum { full, degraded, unsupported };
 
-fn w32Init() void {
-    if (w32_class_registered) return;
-    w32_instance = w32.GetModuleHandleW(null);
-    w32_thread_id = w32.GetCurrentThreadId();
-    _ = w32.QueryPerformanceFrequency(&w32_qpc_freq);
-    const cls = std.unicode.utf8ToUtf16LeStringLiteral("nano_gui_win32");
-    const wc = w32.WNDCLASSW{ .lpfnWndProc = w32Proc, .hInstance = w32_instance, .lpszClassName = cls };
-    _ = w32.RegisterClassW(&wc);
-    w32_class_registered = true;
-}
-
-fn w32Find(hwnd: winapi.HWND) ?*Window {
-    for (headless_state.windows.items) |w| {
-        if (w.hwnd) |h| if (h == hwnd) return w;
-    }
-    return null;
-}
-
-fn w32Push(w: *Window, data: Data) void {
-    const e = Event{ .window = w, .time_ms = nowMs(), .data = data };
-    headless_state.events.append(headless_state.gpa, e) catch {};
-}
-
-fn w32Mods() Mods {
-    return .{
-        .shift = (@as(u16, @bitCast(w32.GetKeyState(0x10))) & 0x8000) != 0,
-        .ctrl = (@as(u16, @bitCast(w32.GetKeyState(0x11))) & 0x8000) != 0,
-        .alt = (@as(u16, @bitCast(w32.GetKeyState(0x12))) & 0x8000) != 0,
-        .win = ((@as(u16, @bitCast(w32.GetKeyState(0x5B))) | @as(u16, @bitCast(w32.GetKeyState(0x5C)))) & 0x8000) != 0,
+pub fn supportFor(cap: Capability) Support {
+    return switch (cap) {
+        .process_init, .window_creation, .close_request, .message_loop, .mouse_key, .clock, .clipboard, .monitors, .gl_context, .vsync => .full,
+        .per_window_scale, .placement, .nested_frame, .mouse_capture, .keyboard_text, .ime, .cursor_shape, .metrics, .appearance, .ole_drop, .popup_window => .degraded,
+        .dark_title_bar, .session_power, .dialogs, .tray, .context_loss => .unsupported,
     };
-}
-
-fn w32Proc(hwnd: winapi.HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
-    const w = w32Find(hwnd) orelse return w32.DefWindowProcW(hwnd, msg, wp, lp);
-    const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lp))))));
-    const y: i32 = @as(i16, @bitCast(@as(u16, @truncate((@as(usize, @bitCast(lp)) >> 16)))));
-    switch (msg) {
-        w32.WM_MOUSEMOVE => w32Push(w, .{ .mouse_move = .{ .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
-        w32.WM_LBUTTONDOWN, w32.WM_LBUTTONUP => w32Push(w, .{ .mouse_button = .{ .button = .left, .down = msg == w32.WM_LBUTTONDOWN, .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
-        w32.WM_RBUTTONDOWN, w32.WM_RBUTTONUP => w32Push(w, .{ .mouse_button = .{ .button = .right, .down = msg == w32.WM_RBUTTONDOWN, .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
-        w32.WM_MBUTTONDOWN, w32.WM_MBUTTONUP => w32Push(w, .{ .mouse_button = .{ .button = .middle, .down = msg == w32.WM_MBUTTONDOWN, .pos = .{ .x = x, .y = y }, .mods = w32Mods() } }),
-        w32.WM_MOUSEWHEEL => {
-            var pt = w32.POINT{ .x = x, .y = y };
-            _ = w32.ScreenToClient(hwnd, &pt);
-            const raw: i16 = @bitCast(@as(u16, @truncate((wp >> 16))));
-            w32Push(w, .{ .wheel = .{ .axis = .vertical, .raw = raw, .steps = @divTrunc(raw, 120), .pos = .{ .x = pt.x, .y = pt.y }, .mods = w32Mods() } });
-        },
-        w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN, w32.WM_KEYUP, w32.WM_SYSKEYUP => {
-            const down = msg == w32.WM_KEYDOWN or msg == w32.WM_SYSKEYDOWN;
-            const vk: u16 = @truncate(wp & 0xFFFF);
-            const lp_u: usize = @bitCast(lp);
-            if (std.enums.fromInt(VirtualKey, vk)) |key| {
-                w32Push(w, .{ .key = .{ .vk = key, .scancode = @truncate(lp_u), .down = down, .repeat = ((lp_u >> 30) & 1) != 0, .mods = w32Mods(), .extended = ((lp_u >> 24) & 1) != 0 } });
-            }
-        },
-        w32.WM_CHAR => {
-            const cp: u21 = @intCast(@as(u16, @truncate(wp & 0xFFFF)));
-            if (cp >= 0x20 and cp != 0x7F) {
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-                if (n > 0) {
-                    const copy = headless_state.gpa.dupe(u8, buf[0..n]) catch return 0;
-                    w32Push(w, .{ .text = copy });
-                }
-            }
-        },
-        w32.WM_SETFOCUS => w32Push(w, .{ .focus = .{ .gained = true } }),
-        w32.WM_KILLFOCUS => w32Push(w, .{ .focus = .{ .gained = false } }),
-        w32.WM_ACTIVATE => w32Push(w, .{ .activate = .{ .active = (wp & 0xFFFF) != 0, .by_click = (wp >> 16) == 2 } }),
-        w32.WM_SIZE => {
-            var r: w32.RECT = .{};
-            _ = w32.GetClientRect(hwnd, &r);
-            w.client = .{ .w = r.right - r.left, .h = r.bottom - r.top };
-            w32Push(w, .{ .resized = .{ .client = w.client, .state = if (r.right - r.left == 0) .minimized else .normal } });
-            if (w.frame_callback) |cb| cb(w, .size);
-        },
-        w32.WM_DPICHANGED => {
-            const dpi: u32 = @truncate(wp & 0xFFFF);
-            w.dpi = dpi;
-            w.scale_value = @as(f32, @floatFromInt(dpi)) / 96.0;
-            w32Push(w, .{ .dpi_changed = .{ .dpi = dpi, .scale = w.scale_value } });
-        },
-        w32.WM_PAINT => {
-            var ps: w32.PAINTSTRUCT = .{};
-            _ = w32.BeginPaint(hwnd, &ps);
-            w32Push(w, .{ .repaint = .{ .rect = .{ .x = 0, .y = 0, .w = w.client.w, .h = w.client.h } } });
-            _ = w32.EndPaint(hwnd, &ps);
-            return 0;
-        },
-        w32.WM_ERASEBKGND => return 1,
-        w32.WM_CLOSE => {
-            w32Push(w, .close_requested);
-            return 0;
-        },
-        w32.WM_DESTROY => {
-            w32Push(w, .{ .visibility = .{ .visible = false } });
-        },
-        w32.WM_GETMINMAXINFO => {},
-        else => {},
-    }
-    return w32.DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-fn w32CreateWindow(opts: WindowOptions) !*Window {
-    w32Init();
-    const w = try headless_state.gpa.create(Window);
-    w.* = .{
-        .id = headless_state.next_id,
-        .title = opts.title,
-        .client = .{ .w = @intFromFloat(@round(opts.client_size.w)), .h = @intFromFloat(@round(opts.client_size.h)) },
-        .visible = !opts.hidden,
-        .dpi = 96,
-    };
-    headless_state.next_id += 1;
-    var r = w32.RECT{ .left = 0, .top = 0, .right = w.client.w, .bottom = w.client.h };
-    _ = w32.AdjustWindowRectEx(&r, 0x00CF0000, 0, 0);
-    const title_z = try std.unicode.utf8ToUtf16LeAllocZ(headless_state.gpa, opts.title);
-    defer headless_state.gpa.free(title_z);
-    const cls = std.unicode.utf8ToUtf16LeStringLiteral("nano_gui_win32");
-    const hwnd = w32.CreateWindowExW(0, cls, title_z.ptr, 0x00CF0000, w32.CW_USEDEFAULT, w32.CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, null, null, w32_instance, null) orelse return error.CreateWindowFailed;
-    w.hwnd = hwnd;
-    const dpi = w32.GetDpiForWindow(hwnd);
-    if (dpi != 0) {
-        w.dpi = dpi;
-        w.scale_value = @as(f32, @floatFromInt(dpi)) / 96.0;
-    }
-    try headless_state.windows.append(headless_state.gpa, w);
-    if (!opts.hidden) {
-        _ = w32.ShowWindow(hwnd, 5);
-        _ = w32.UpdateWindow(hwnd);
-    }
-    return w;
-}
-
-fn w32Pump() usize {
-    var msg: w32.MSG = .{};
-    var n: usize = 0;
-    while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
-        _ = w32.TranslateMessage(&msg);
-        _ = w32.DispatchMessageW(&msg);
-        n += 1;
-    }
-    return n;
-}
-
-fn w32Wait(timeout_ms: ?u32) WaitResult {
-    const ms: u32 = if (timeout_ms) |v| v else 0xFFFFFFFF;
-    const r = w32.MsgWaitForMultipleObjectsEx(0, null, ms, w32.QS_ALLINPUT, w32.MWMO_INPUTAVAILABLE);
-    if (r == 0) return .message;
-    if (r == 258) return .timeout;
-    return .idle;
-}
-
-fn w32Now() u64 {
-    var c: i64 = 0;
-    _ = w32.QueryPerformanceCounter(&c);
-    if (w32_qpc_freq == 0) return @intCast(@divTrunc(c, 1000));
-    return @intCast(@divTrunc(c * 1000, w32_qpc_freq));
-}
-
-fn w32Present(w: *Window) void {
-    const hwnd = w.hwnd orelse return;
-    if (w.present_rgba.len == 0 or w.present_w == 0 or w.present_h == 0) return;
-    const dc = w32.GetDC(hwnd) orelse return;
-    defer _ = w32.ReleaseDC(hwnd, dc);
-    var bmi = w32.BITMAPINFO{};
-    bmi.bmiHeader.biWidth = @intCast(w.present_w);
-    bmi.bmiHeader.biHeight = -@as(i32, @intCast(w.present_h));
-    var buf = headless_state.gpa.alloc(u8, w.present_rgba.len) catch return;
-    defer headless_state.gpa.free(buf);
-    var i: usize = 0;
-    while (i < w.present_rgba.len / 4) : (i += 1) {
-        const o = i * 4;
-        buf[o] = w.present_rgba[o + 2];
-        buf[o + 1] = w.present_rgba[o + 1];
-        buf[o + 2] = w.present_rgba[o];
-        buf[o + 3] = 0;
-    }
-    _ = w32.SetDIBitsToDevice(dc, 0, 0, w.present_w, w.present_h, 0, 0, 0, w.present_h, buf.ptr, &bmi, 0);
 }

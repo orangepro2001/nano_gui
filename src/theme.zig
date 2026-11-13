@@ -202,6 +202,10 @@ pub const Theme = struct {
         return self.durations_ms.get(d);
     }
 
+    pub fn durationsOn(self: *const Theme) bool {
+        return self.durations_ms.get(.normal) > 0;
+    }
+
     /// REQ-THEME-009：由系统强调色派生强调色族。系统强调色（丢弃 alpha）等于默认强调色
     /// 或接近灰色（S < 0.15）时，强调色族直接取 REQ-THEME-007 表值，不派生。
     pub fn deriveAccent(self: *Theme, system_accent: core.Color) void {
@@ -385,7 +389,7 @@ fn fillDurations(d: *std.EnumArray(Duration, u16)) void {
     d.set(.autoscroll, 50);
 }
 
-const light_values = struct {
+const LightValues = struct {
     const arr = [_]struct { t: ColorToken, hex: u32, a: u8 }{
         .{ .t = .surface_window, .hex = 0xECEEF1, .a = 255 },
         .{ .t = .surface_panel, .hex = 0xF4F5F7, .a = 255 },
@@ -434,7 +438,7 @@ const light_values = struct {
     };
 };
 
-const dark_values = struct {
+const DarkValues = struct {
     const arr = [_]struct { t: ColorToken, hex: u32, a: u8 }{
         .{ .t = .surface_window, .hex = 0x1F2125, .a = 255 },
         .{ .t = .surface_panel, .hex = 0x26292E, .a = 255 },
@@ -485,9 +489,9 @@ const dark_values = struct {
 
 fn fillColors(dst: *std.EnumArray(ColorToken, core.Color), dark: bool) void {
     if (dark) {
-        for (dark_values.arr) |v| dst.set(v.t, core.Color.fromHex(v.hex, v.a));
+        for (DarkValues.arr) |v| dst.set(v.t, core.Color.fromHex(v.hex, v.a));
     } else {
-        for (light_values.arr) |v| dst.set(v.t, core.Color.fromHex(v.hex, v.a));
+        for (LightValues.arr) |v| dst.set(v.t, core.Color.fromHex(v.hex, v.a));
     }
 }
 
@@ -561,7 +565,10 @@ pub const MarkKind = enum {
     more,
 };
 
-pub const Icon = union(enum) { mark: MarkKind, image: gfx.ImageId };
+pub const Icon = union(enum) { mark: MarkKind, image: gfx.ImageId, set: gfx.ImageSet };
+
+pub const CheckState = enum { off, on, mixed };
+pub const TrackTone = enum { accent, warning, danger, disabled };
 
 pub const DrawCtx = struct {
     canvas: *gfx.Canvas,
@@ -661,18 +668,163 @@ pub fn drawSelection(ctx: *const DrawCtx, r: core.Rect, active: bool) void {
 }
 
 pub fn drawTrack(ctx: *const DrawCtx, r: core.Rect) void {
+    drawTrackState(ctx, r, false);
+}
+
+/// 槽绘制变体：禁用态使用 `surface_sunken_disabled` 且不画内阴影（REQ-THEME-040）。线程：界面线程。
+pub fn drawTrackState(ctx: *const DrawCtx, r: core.Rect, disabled: bool) void {
     const t = ctx.theme;
-    ctx.canvas.fillRoundRect(r, t.metric(.radius_mark), t.color(.surface_track));
-    if (r.h > 4) {
+    ctx.canvas.fillRoundRect(r, t.metric(.radius_mark), t.color(if (disabled) .surface_sunken_disabled else .surface_track));
+    if (!disabled and r.h > 4) {
         ctx.canvas.fillRect(.{ .x = r.x + 2, .y = r.y, .w = @max(0, r.w - 4), .h = @as(f32, @floatFromInt(t.hairline(ctx.scale))) }, t.color(.inset_shadow));
     }
 }
 
 pub fn drawTrackFill(ctx: *const DrawCtx, r: core.Rect) void {
-    ctx.canvas.fillRoundRect(r, ctx.theme.metric(.radius_mark), ctx.theme.color(.accent_mark));
+    drawTrackFillTone(ctx, r, .accent);
+}
+
+/// 槽填充变体：按状态色调选择填充令牌（REQ-THEME-040）。线程：界面线程。
+pub fn drawTrackFillTone(ctx: *const DrawCtx, r: core.Rect, tone: TrackTone) void {
+    const tok: ColorToken = switch (tone) {
+        .accent => .accent_mark,
+        .warning => .status_warning,
+        .danger => .status_danger,
+        .disabled => .text_disabled,
+    };
+    ctx.canvas.fillRoundRect(r, ctx.theme.metric(.radius_mark), ctx.theme.color(tok));
+}
+
+/// 不确定进度条纹：竖直条纹宽与间隔均取 `gap_sm`，按 `phase` 水平平移（REQ-THEME-040）。线程：界面线程。
+pub fn drawTrackStripes(ctx: *const DrawCtx, r: core.Rect, phase: f32) void {
+    const t = ctx.theme;
+    const w = @max(2.0, t.metric(.gap_sm));
+    const period = w * 2.0;
+    const p = phase - @floor(phase);
+    ctx.canvas.pushClip(r);
+    defer ctx.canvas.popClip();
+    var x = r.x - period + p * period;
+    while (x < r.right()) : (x += period) {
+        const x0 = @max(r.x, x);
+        const x1 = @min(r.right(), x + w);
+        if (x1 > x0) {
+            ctx.canvas.fillRect(.{ .x = x0, .y = r.y, .w = x1 - x0, .h = r.h }, t.color(.accent_mark));
+        }
+    }
+}
+
+/// 行内焦点指示矩形（REQ-THEME-038）：非活动窗口不画，活动选中行使用反白前景。线程：界面线程。
+pub fn drawRowFocus(ctx: *const DrawCtx, r: core.Rect, on_selection: bool) void {
+    if (!ctx.window_active or r.w <= 0 or r.h <= 0) return;
+    const t = ctx.theme;
+    const tok: ColorToken = if (on_selection) .text_on_accent else .accent_mark;
+    ctx.canvas.strokeRect(r, t.color(tok), t.hairline(ctx.scale));
+}
+
+/// 勾选框专用基元（REQ-THEME-039）。线程：界面线程。
+pub fn drawCheckBox(ctx: *const DrawCtx, r: core.Rect, state: CheckState, progress: f32, v: Visual) void {
+    const t = ctx.theme;
+    const p = std.math.clamp(progress, 0, 1);
+    const rad = t.metric(.radius_mark);
+    const h = t.hairline(ctx.scale);
+    if (v.disabled) {
+        ctx.canvas.fillRoundRect(r, rad, t.color(.surface_sunken_disabled));
+        ctx.canvas.strokeRoundRect(r, rad, t.color(.border_control_disabled), h);
+        if (state != .off) {
+            drawMark(ctx, if (state == .mixed) .indeterminate else .check, r, .text_disabled);
+        }
+        return;
+    }
+    if (state == .off and p <= 0.001) {
+        drawSunken(ctx, r, .radius_mark, v, false);
+        return;
+    }
+    const on_top = if (v.pressed) t.color(.accent_fill_pressed_top) else if (v.hovered) t.color(.accent_fill_hover_top) else t.color(.accent_fill_top);
+    const on_bot = if (v.pressed) t.color(.accent_fill_pressed_bottom) else if (v.hovered) t.color(.accent_fill_hover_bottom) else t.color(.accent_fill_bottom);
+    const off_bg = t.color(.surface_sunken);
+    const off_border = if (v.hovered) t.color(.border_control_hover) else t.color(.border_control);
+    const top = core.Color.lerp(off_bg, on_top, p);
+    const bot = core.Color.lerp(off_bg, on_bot, p);
+    const border = core.Color.lerp(off_border, t.color(.accent_border), p);
+    ctx.canvas.fillRoundRectV(r, rad, top, bot);
+    ctx.canvas.strokeRoundRect(r, rad, border, h);
+    if (p > 0.05) {
+        drawMark(ctx, if (state == .mixed) .indeterminate else .check, r, .text_on_accent);
+    }
+}
+
+/// 单选框专用基元（REQ-THEME-039）。线程：界面线程。
+pub fn drawRadio(ctx: *const DrawCtx, r: core.Rect, on: bool, progress: f32, v: Visual) void {
+    const t = ctx.theme;
+    const p = std.math.clamp(progress, 0, 1);
+    const rad = @min(r.w, r.h) * 0.5;
+    const h = t.hairline(ctx.scale);
+    if (v.disabled) {
+        ctx.canvas.fillRoundRect(r, rad, t.color(.surface_sunken_disabled));
+        ctx.canvas.strokeRoundRect(r, rad, t.color(.border_control_disabled), h);
+        if (on) drawMark(ctx, .radio_dot, r, .text_disabled);
+        return;
+    }
+    const on_top = if (v.pressed) t.color(.accent_fill_pressed_top) else if (v.hovered) t.color(.accent_fill_hover_top) else t.color(.accent_fill_top);
+    const on_bot = if (v.pressed) t.color(.accent_fill_pressed_bottom) else if (v.hovered) t.color(.accent_fill_hover_bottom) else t.color(.accent_fill_bottom);
+    const off_bg = t.color(.surface_sunken);
+    const off_border = if (v.hovered) t.color(.border_control_hover) else t.color(.border_control);
+    ctx.canvas.fillRoundRectV(r, rad, core.Color.lerp(off_bg, on_top, p), core.Color.lerp(off_bg, on_bot, p));
+    ctx.canvas.strokeRoundRect(r, rad, core.Color.lerp(off_border, t.color(.accent_border), p), h);
+    if (p > 0.05) {
+        const s = @min(r.w, r.h) * 0.36 * p;
+        const c = r.center();
+        ctx.canvas.fillRoundRect(.{ .x = c.x - s * 0.5, .y = c.y - s * 0.5, .w = s, .h = s }, s, t.color(.text_on_accent));
+    }
+}
+
+/// 开关专用基元（REQ-THEME-039）。线程：界面线程。
+pub fn drawSwitch(ctx: *const DrawCtx, r: core.Rect, on: bool, progress: f32, v: Visual) void {
+    _ = on;
+    const t = ctx.theme;
+    const p = std.math.clamp(progress, 0, 1);
+    const rad = t.metric(.radius_mark);
+    const h = t.hairline(ctx.scale);
+    const hp = @as(f32, @floatFromInt(h)) / ctx.scale;
+    if (v.disabled) {
+        ctx.canvas.fillRoundRect(r, rad, t.color(.surface_sunken_disabled));
+        ctx.canvas.strokeRoundRect(r, rad, t.color(.border_control_disabled), h);
+    } else {
+        const track_col = core.Color.lerp(t.color(.surface_track), t.color(.accent_mark), p);
+        const border_col = core.Color.lerp(if (v.hovered) t.color(.border_control_hover) else t.color(.border_control), t.color(.accent_border), p);
+        ctx.canvas.fillRoundRect(r, rad, track_col);
+        ctx.canvas.strokeRoundRect(r, rad, border_col, h);
+    }
+    const knob_s = @max(4.0, r.h - hp * 2.0);
+    const travel = @max(0.0, r.w - hp * 2.0 - knob_s);
+    const kx = r.x + hp + travel * p;
+    const knob = core.Rect{ .x = @round(kx * ctx.scale) / ctx.scale, .y = r.y + hp, .w = knob_s, .h = knob_s };
+    drawRaised(ctx, knob, .radius_mark, .neutral, .{ .hovered = v.hovered, .pressed = v.pressed, .focused_visible = false, .disabled = v.disabled, .hover_t = v.hover_t, .press_t = v.press_t, .focus_t = 0 });
+}
+
+/// 标签页标签专用基元（REQ-THEME-041）。线程：界面线程。
+pub fn drawTab(ctx: *const DrawCtx, r: core.Rect, selected: bool, v: Visual) void {
+    const t = ctx.theme;
+    const h = t.hairline(ctx.scale);
+    if (selected) {
+        const rad = t.metric(.radius_control);
+        ctx.canvas.fillRoundRect(r, rad, t.color(.surface_panel));
+        ctx.canvas.strokeLine(.{ .x = r.x, .y = r.y }, .{ .x = r.right(), .y = r.y }, t.color(.border_strong), h);
+        ctx.canvas.strokeLine(.{ .x = r.x, .y = r.y }, .{ .x = r.x, .y = r.bottom() }, t.color(.border_strong), h);
+        ctx.canvas.strokeLine(.{ .x = r.right(), .y = r.y }, .{ .x = r.right(), .y = r.bottom() }, t.color(.border_strong), h);
+    } else if (v.hovered and !v.disabled) {
+        ctx.canvas.fillRect(r, t.color(.surface_row_hover));
+    }
 }
 
 pub fn drawMark(ctx: *const DrawCtx, kind: MarkKind, r: core.Rect, color: ColorToken) void {
+    drawMarkRotated(ctx, kind, r, color, 0);
+}
+
+/// 带旋转角的矢量标记绘制（REQ-THEME-029）。线程：界面线程。
+pub fn drawMarkRotated(ctx: *const DrawCtx, kind: MarkKind, r: core.Rect, color: ColorToken, rotation: f32) void {
+    if (rotation != 0) ctx.canvas.pushRotate(r.center(), rotation);
+    defer if (rotation != 0) ctx.canvas.popTransform();
     const c = ctx.theme.color(color);
     const w = ctx.theme.hairline(ctx.scale);
     const cx = r.center();

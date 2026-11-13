@@ -9,6 +9,7 @@ const theme = @import("theme.zig");
 pub const Chord = struct { key: platform.VirtualKey, mods: platform.Mods = .{} };
 
 pub const CommandId = enum(u32) { none = 0, _ };
+pub const CommandState = struct { enabled: bool = true, checked: ?bool = null };
 pub const EditCommand = enum { undo, redo, cut, copy, paste, delete, select_all };
 
 pub const ImeCaret = struct { caret: core.Rect, exclude: ?core.Rect = null };
@@ -82,9 +83,12 @@ pub const InteractOpts = struct {
     text_input: bool = false,
     preempt: KeyMask = .{},
     handles: KeyMask = .{},
+    observes: KeyMask = .{},
     wheel_caps: WheelCaps = .{},
     edit: EditCaps = .{},
     reveal_target: bool = false,
+    /// 悬停外观使用 paint 级动画（REQ-FRAME-046）。
+    hover_anim: bool = false,
 };
 
 pub const Interaction = struct {
@@ -148,7 +152,15 @@ pub const GroupOrientation = enum { horizontal, vertical, both };
 pub const GroupSpec = struct { orientation: GroupOrientation, wrap: bool = true, home_end: bool = true, current: core.WidgetId = .none };
 pub const ScopeSpec = struct { default_button: core.WidgetId = .none, cancel_button: core.WidgetId = .none, initial_focus: core.WidgetId = .none, trap_tab: bool = false };
 
-pub const MnemonicAction = enum { activate, focus, focus_next };
+pub const MnemonicAction = enum { activate, focus, focus_next, focus_within };
+/// 助记符键比较使用小写形式（REQ-INPUT-046）。
+fn lowerCodepoint(cp: u21) u21 {
+    if (cp >= 'A' and cp <= 'Z') return cp + ('a' - 'A');
+    if (cp >= 0x00C0 and cp <= 0x00DE and cp != 0x00D7) return cp + 0x20;
+    if (cp >= 0x0410 and cp <= 0x042F) return cp + 0x20;
+    return cp;
+}
+
 pub const Mnemonic = struct {
     text: []const u8,
     underline: ?struct { start: u32, len: u32 } = null,
@@ -172,7 +184,7 @@ pub fn parseMnemonic(arena: std.mem.Allocator, label: []const u8) Mnemonic {
             const r = core.nextCodepoint(label, i + 1);
             if (marked_start == null) {
                 marked_start = @intCast(out.items.len);
-                marked_key = r.cp;
+                marked_key = lowerCodepoint(r.cp);
             }
             out.appendSlice(arena, label[i + 1 .. i + 1 + r.len]) catch {};
             i += 1 + r.len;
@@ -283,5 +295,80 @@ test "parse mnemonic" {
     defer arena.deinit();
     const m = parseMnemonic(arena.allocator(), "保存(&S)");
     try std.testing.expectEqualStrings("保存(S)", m.text);
-    try std.testing.expectEqual(@as(u21, 'S'), m.key.?);
+    try std.testing.expectEqual(@as(u21, 's'), m.key.?);
 }
+
+// ---------------------------------------------------------------------------
+// 应用内拖动会话（REQ-INPUT-059 至 061 的核心状态）
+// ---------------------------------------------------------------------------
+
+pub const DragSession = struct {
+    active: bool = false,
+    started: bool = false,
+    cancelled: bool = false,
+    dropped: bool = false,
+    source: core.WidgetId = .none,
+    payload: DragPayload = .{ .kind = 0 },
+    origin: core.Vec2 = .{},
+    current: core.Vec2 = .{},
+    threshold: core.Vec2 = .{ .x = 4, .y = 4 },
+    over: core.WidgetId = .none,
+    acceptable: bool = false,
+    last_effect: platform.DropEffect = .none,
+
+    pub fn begin(self: *DragSession, source: core.WidgetId, payload: DragPayload, pos: core.Vec2, threshold_px: f32) void {
+        self.* = .{
+            .active = true,
+            .source = source,
+            .payload = payload,
+            .origin = pos,
+            .current = pos,
+            .threshold = .{ .x = threshold_px, .y = threshold_px },
+        };
+    }
+
+    /// 指针移动；第一次越过拖拽阈值时返回 true（拖拽开始）。
+    pub fn move(self: *DragSession, pos: core.Vec2, over: core.WidgetId, acceptable: bool) bool {
+        if (!self.active or self.cancelled) return false;
+        self.current = pos;
+        self.over = over;
+        self.acceptable = acceptable;
+        if (!self.started) {
+            const dx = @abs(pos.x - self.origin.x);
+            const dy = @abs(pos.y - self.origin.y);
+            if (dx > self.threshold.x or dy > self.threshold.y) {
+                self.started = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn finish(self: *DragSession, inside: bool) ?DropState {
+        if (!self.active or self.cancelled) return null;
+        const ok = inside and self.acceptable;
+        self.dropped = ok;
+        self.last_effect = if (ok) .move else .none;
+        const state = DropState{
+            .over = ok,
+            .acceptable = self.acceptable,
+            .pos = self.current,
+            .dropped = ok,
+            .payload = self.payload,
+            .effect = self.last_effect,
+        };
+        self.active = false;
+        return state;
+    }
+
+    pub fn cancel(self: *DragSession) void {
+        self.cancelled = true;
+        self.active = false;
+        self.started = false;
+    }
+
+    /// 外部载荷随指针离开窗口时是否应转交 `platform.startDrag`（REQ-INPUT-061）。
+    pub fn shouldStartExternal(self: *const DragSession, pointer_inside: bool) bool {
+        return self.payload.external != null and !pointer_inside and (self.active or self.dropped);
+    }
+};

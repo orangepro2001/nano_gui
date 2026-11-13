@@ -5,7 +5,7 @@
 //! 使用同一接口做单元测试与调试快照。
 
 const std = @import("std");
-const core = @import("core.zig");
+const core = @import("../core.zig");
 
 pub const ControlType = enum {
     button,
@@ -22,12 +22,18 @@ pub const ControlType = enum {
     tree_item,
     table,
     data_grid,
+    data_item,
+    header,
+    header_item,
     menu,
     menu_item,
     dialog,
     tooltip,
     custom,
 };
+
+pub const SortDirection = enum { none, ascending, descending };
+pub const ExpandState = enum { collapsed, expanded, leaf_node };
 
 pub const Pattern = enum {
     invoke,
@@ -39,7 +45,9 @@ pub const Pattern = enum {
     scroll_item,
     expand_collapse,
     grid,
+    grid_item,
     table,
+    table_item,
     range_value,
     text,
 };
@@ -55,6 +63,18 @@ pub const Node = struct {
     expanded: ?bool = null,
     patterns: []const Pattern = &.{},
     parent: core.WidgetId = .none,
+    can_select_multiple: bool = false,
+    selection_required: bool = false,
+    row_count: usize = 0,
+    column_count: usize = 0,
+    row_major: bool = true,
+    level: u16 = 0,
+    expand_state: ?ExpandState = null,
+    sort_direction: ?SortDirection = null,
+    row: ?usize = null,
+    column: ?u16 = null,
+    row_span: u16 = 1,
+    column_span: u16 = 1,
 };
 
 pub const Provider = struct {
@@ -90,6 +110,29 @@ pub const Registry = struct {
         return @tagName(p);
     }
 };
+
+pub const uia_root_object_id: isize = -25;
+
+var global_provider: ?Provider = null;
+var uia_active: bool = false;
+
+/// 注册或清除平台级 UIA 提供者（REQ-PLAT-080）。线程：界面线程。
+pub fn setProvider(provider: ?Provider) void {
+    global_provider = provider;
+    uia_active = provider != null;
+}
+
+/// 查询当前是否已收到 UIA 查询或注册提供者（AC-PLAT-047）。线程：界面线程。
+pub fn isEnabled() bool {
+    return uia_active or global_provider != null;
+}
+
+/// 响应 `WM_GETOBJECT`：若为 `UiaRootObjectId` 则激活 UIA 并返回 true（AC-PLAT-047）。线程：界面线程。
+pub fn handleGetObject(obj_id: isize) bool {
+    if (obj_id != uia_root_object_id) return false;
+    uia_active = true;
+    return global_provider != null;
+}
 
 test "uia role/pattern names are stable" {
     try std.testing.expectEqualStrings("button", Registry.roleName(.button));

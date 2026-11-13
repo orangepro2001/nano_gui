@@ -10,9 +10,9 @@ pub const input = @import("input.zig");
 pub const ui = @import("ui.zig");
 pub const widgets = @import("widgets.zig");
 pub const app = @import("app.zig");
-pub const commands = @import("commands.zig");
-pub const settings = @import("settings.zig");
-pub const uia = @import("uia.zig");
+pub const commands = app.commands;
+pub const settings = app.settings;
+pub const uia = platform.uia;
 
 pub const version = "0.1.0";
 

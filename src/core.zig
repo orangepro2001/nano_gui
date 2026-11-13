@@ -2,6 +2,7 @@
 //! 本模块不依赖任何其他模块与操作系统 API（REQ-ARCH-002）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Vec2 = struct {
     x: f32 = 0,
@@ -259,17 +260,33 @@ pub fn hashU64(seed: u64, value: u64) u64 {
 
 pub const FrameArena = struct {
     arena: std.heap.ArenaAllocator,
+    last_cap: usize = 0,
 
     pub fn init(backing: std.mem.Allocator) FrameArena {
-        return .{ .arena = std.heap.ArenaAllocator.init(backing) };
+        // 若传入的是 PersistentAllocator，直接取其底层分配器以保留泄漏检测，
+        // 同时避免把竞技场块内存重复计入 alloc.persistent.bytes（REQ-PERF-027）。
+        const actual = if (backing.vtable == &PersistentAllocator.vtable_inst)
+            @as(*PersistentAllocator, @ptrCast(@alignCast(backing.ptr))).baseAlloc()
+        else
+            backing;
+        return .{ .arena = std.heap.ArenaAllocator.init(actual) };
     }
     pub fn deinit(self: *FrameArena) void {
         self.arena.deinit();
     }
+    fn noteGrow(self: *FrameArena) void {
+        const cap = self.arena.queryCapacity();
+        if (cap > self.last_cap) {
+            if (self.last_cap > 0) stats.counter("alloc.frame.grow_count").* += 1;
+            self.last_cap = cap;
+        }
+    }
     pub fn allocator(self: *FrameArena) std.mem.Allocator {
+        self.noteGrow();
         return self.arena.allocator();
     }
     pub fn reset(self: *FrameArena) void {
+        self.noteGrow();
         _ = self.arena.reset(.retain_capacity);
     }
     pub fn bytesUsed(self: *const FrameArena) usize {
@@ -300,7 +317,17 @@ pub const log = struct {
         sink = s;
     }
 
+    /// 该级别在当前构建中是否保留（REQ-ARCH-020）：调试构建四级全部保留，
+    /// 发布构建只保留 err/warn。线程安全。
+    pub fn enabled(level: Level) bool {
+        if (builtin.optimize == .debug) return true;
+        return level == .err or level == .warn;
+    }
+
+    /// 线程安全（REQ-ARCH-008）：写一条日志；未保留的级别直接丢弃，其余交给接收器，
+    /// 未设置接收器时输出到标准错误。
     pub fn write(level: Level, tag: []const u8, comptime fmt: []const u8, args: anytype) void {
+        if (!enabled(level)) return;
         acquire();
         const s = sink;
         release();
@@ -309,7 +336,6 @@ pub const log = struct {
             const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
             cb(level, tag, msg);
         } else {
-            if (level == .debug and @import("builtin").mode == .ReleaseFast) return;
             std.debug.print("[{s}] {s}: " ++ fmt ++ "\n", .{ @tagName(level), tag } ++ args);
         }
     }
@@ -571,6 +597,124 @@ pub const stats = struct {
             timers[i].head = 0;
             timers[i].started = false;
         }
+    }
+};
+
+/// 界面线程标记与框架唯一的线程创建入口（REQ-ARCH-007、REQ-ARCH-009）。
+pub const thread = struct {
+    var ui_marked = std.atomic.Value(bool).init(false);
+    var ui_id = std.atomic.Value(std.Thread.Id).init(0);
+
+    /// 把当前线程登记为界面线程。由 `App.init` 调用；重复调用以最后一次为准。
+    /// 线程：界面线程。
+    pub fn markUiThread() void {
+        ui_id.store(std.Thread.getCurrentId(), .release);
+        ui_marked.store(true, .release);
+    }
+
+    /// 当前线程是否为界面线程；尚未登记界面线程时视为是。线程安全。
+    pub fn isUiThread() bool {
+        if (!ui_marked.load(.acquire)) return true;
+        return ui_id.load(.acquire) == std.Thread.getCurrentId();
+    }
+
+    /// 非线程安全 API 的入口断言（REQ-ARCH-009）：仅调试构建检查，
+    /// 违反时以说明规则与调用点的信息中止。线程安全（只读）。
+    pub fn assertUiThread(comptime api: []const u8, src: std.builtin.SourceLocation) void {
+        if (builtin.optimize != .debug) return;
+        if (isUiThread()) return;
+        std.debug.panic("nano_gui: 违反 REQ-ARCH-009：{s} 不是线程安全 API，只能在界面线程调用（调用点 {s}:{d}）", .{ api, src.file, src.line });
+    }
+
+    /// 框架内部创建线程的唯一入口（REQ-ARCH-007）：每次调用使计数器 `threads.created` 加一。
+    /// 框架自身不应调用本函数；它供应用与测试经框架创建工作线程时统一计数。线程：任意线程。
+    pub fn spawn(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) std.Thread.SpawnError!std.Thread {
+        const t = try std.Thread.spawn(config, function, args);
+        _ = @atomicRmw(u64, stats.counter("threads.created"), .Add, 1, .monotonic);
+        return t;
+    }
+
+    /// 经 `spawn` 创建的线程总数。线程安全。
+    pub fn createdCount() u64 {
+        return stats.read("threads.created") orelse 0;
+    }
+};
+
+/// 持久分配器（REQ-ARCH-015）：调试构建为带泄漏检测的 `DebugAllocator`，
+/// 发布构建直接使用 `smp_allocator`。
+pub const PersistentAllocator = struct {
+    const is_debug = builtin.optimize == .debug;
+    const DebugAlloc = std.heap.DebugAllocator(.{});
+
+    inner: if (is_debug) DebugAlloc else void = if (is_debug) .init else {},
+
+    pub fn init() PersistentAllocator {
+        return .{};
+    }
+
+    fn baseAlloc(self: *PersistentAllocator) std.mem.Allocator {
+        if (is_debug) return self.inner.allocator();
+        return std.heap.smp_allocator;
+    }
+
+    const vtable_inst = std.mem.Allocator.VTable{
+        .alloc = pAlloc,
+        .resize = pResize,
+        .remap = pRemap,
+        .free = pFree,
+    };
+
+    fn pAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PersistentAllocator = @ptrCast(@alignCast(ctx));
+        const res = self.baseAlloc().rawAlloc(len, alignment, ret_addr);
+        if (res != null) {
+            _ = @atomicRmw(u64, stats.counter("alloc.persistent.count"), .Add, 1, .monotonic);
+            _ = @atomicRmw(u64, stats.gauge("alloc.persistent.bytes"), .Add, len, .monotonic);
+        }
+        return res;
+    }
+    fn pResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PersistentAllocator = @ptrCast(@alignCast(ctx));
+        const ok = self.baseAlloc().rawResize(memory, alignment, new_len, ret_addr);
+        if (ok) {
+            if (new_len > memory.len) {
+                _ = @atomicRmw(u64, stats.counter("alloc.persistent.count"), .Add, 1, .monotonic);
+                _ = @atomicRmw(u64, stats.gauge("alloc.persistent.bytes"), .Add, new_len - memory.len, .monotonic);
+            } else {
+                _ = @atomicRmw(u64, stats.gauge("alloc.persistent.bytes"), .Sub, memory.len - new_len, .monotonic);
+            }
+        }
+        return ok;
+    }
+    fn pRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PersistentAllocator = @ptrCast(@alignCast(ctx));
+        const res = self.baseAlloc().rawRemap(memory, alignment, new_len, ret_addr);
+        if (res != null) {
+            if (new_len > memory.len) {
+                _ = @atomicRmw(u64, stats.counter("alloc.persistent.count"), .Add, 1, .monotonic);
+                _ = @atomicRmw(u64, stats.gauge("alloc.persistent.bytes"), .Add, new_len - memory.len, .monotonic);
+            } else {
+                _ = @atomicRmw(u64, stats.gauge("alloc.persistent.bytes"), .Sub, memory.len - new_len, .monotonic);
+            }
+        }
+        return res;
+    }
+    fn pFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PersistentAllocator = @ptrCast(@alignCast(ctx));
+        _ = @atomicRmw(u64, stats.gauge("alloc.persistent.bytes"), .Sub, memory.len, .monotonic);
+        self.baseAlloc().rawFree(memory, alignment, ret_addr);
+    }
+
+    /// 取得分配器。线程安全（分配器本身线程安全）。
+    pub fn allocator(self: *PersistentAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable_inst };
+    }
+
+    /// 应用正常退出时调用：调试构建检查泄漏，有泄漏时把分配点打印到标准错误并返回 true，
+    /// 调用方应据此以非零码退出；发布构建恒为 false。线程：界面线程。
+    pub fn deinit(self: *PersistentAllocator) bool {
+        if (!is_debug) return false;
+        return self.inner.deinit() == .leak;
     }
 };
 
